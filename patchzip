@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-VERSION='0.4.20'
+VERSION='0.4.24'
 SCRIPT_NAME='patchzip'
 
 usage() {
@@ -190,21 +190,49 @@ if [[ $ARCHIVE_ID_STEM =~ ^(.+)-v-?([0-9]+([.][0-9]+)*)$ ]]; then
 fi
 
 MATCHING_OLD=''
+MATCHING_OLD_VERSION=''
+MATCHING_OLD_SUFFIXED=1
+MATCHING_OLD_MTIME=0
 shopt -s nullglob
 for candidate in "$PROJECT_ROOT"/*.zip "$PROJECT_ROOT"/*.ZIP; do
     [[ -f $candidate ]] || continue
     [[ "$(basename -- "$candidate")" == "$ARCHIVE_BASE" ]] && continue
     base=$(basename -- "$candidate")
     base_stem=${base%.*}
+    candidate_id_stem=$base_stem
+    candidate_suffixed=0
+    if [[ $candidate_id_stem =~ ^(.+)\([0-9]+\)$ ]]; then
+        candidate_id_stem=${BASH_REMATCH[1]}
+        candidate_suffixed=1
+    fi
     if ((ARCHIVE_VERSIONED)); then
         candidate_project=''
-        if [[ $base_stem =~ ^(.+)-v-?([0-9]+([.][0-9]+)*)$ ]]; then
+        candidate_version=''
+        if [[ $candidate_id_stem =~ ^(.+)-v-?([0-9]+([.][0-9]+)*)$ ]]; then
             candidate_project=${BASH_REMATCH[1]}
+            candidate_version=${BASH_REMATCH[2]}
         fi
         [[ -n $candidate_project && ${candidate_project,,} == ${ARCHIVE_PROJECT,,} ]] || continue
+
+        # Multiple historical project archives are normal. Retire the highest version,
+        # preferring the canonical filename over a duplicate-download suffix.
+        replace_old=0
+        if [[ -z $MATCHING_OLD ]]; then
+            replace_old=1
+        elif [[ $candidate_version != "$MATCHING_OLD_VERSION" ]]; then
+            highest=$(printf '%s\n' "$candidate_version" "$MATCHING_OLD_VERSION" | sort -V | tail -n1)
+            [[ $candidate_version == "$highest" ]] && replace_old=1
+        elif ((candidate_suffixed == 0 && MATCHING_OLD_SUFFIXED != 0)); then
+            replace_old=1
+        fi
+        if ((replace_old)); then
+            MATCHING_OLD=$candidate
+            MATCHING_OLD_VERSION=$candidate_version
+            MATCHING_OLD_SUFFIXED=$candidate_suffixed
+        fi
     else
         # Without the project-v[-]<version>.zip convention, keep the old prefix
-        # matching as a deliberately conservative fallback.
+        # matching as a conservative fallback. If several match, use the newest.
         fallback_prefix=$ARCHIVE_ID_STEM
         if [[ $fallback_prefix =~ ^(.+[-_])v-?[0-9]+([.][0-9]+)*([-_].*)?$ ]]; then
             fallback_prefix=${BASH_REMATCH[1]}
@@ -212,12 +240,11 @@ for candidate in "$PROJECT_ROOT"/*.zip "$PROJECT_ROOT"/*.ZIP; do
             fallback_prefix=${BASH_REMATCH[1]}
         fi
         [[ ${base_stem,,} == "${fallback_prefix,,}"* ]] || continue
-    fi
-
-    if [[ -z $MATCHING_OLD ]]; then
-        MATCHING_OLD=$candidate
-    else
-        fatal "multiple possible old project archives: $(basename -- "$MATCHING_OLD") and $(basename -- "$candidate")"
+        candidate_mtime=$(stat -c '%Y' -- "$candidate")
+        if [[ -z $MATCHING_OLD || $candidate_mtime -gt $MATCHING_OLD_MTIME ]]; then
+            MATCHING_OLD=$candidate
+            MATCHING_OLD_MTIME=$candidate_mtime
+        fi
     fi
 done
 shopt -u nullglob
@@ -555,16 +582,8 @@ for hook in "${HOOK_PERMISSION_FIXES[@]}"; do
     info "fixed executable permission: $hook"
 done
 
-# Place the new archive in the project, matching the established workflow. mv may cross
-# filesystems, so fall back to cp+rm.
-if [[ $ARCHIVE != "$LOCAL_ARCHIVE" ]]; then
-    if ! mv -f -- "$ARCHIVE" "$LOCAL_ARCHIVE" 2>/dev/null; then
-        cp -f -- "$ARCHIVE" "$LOCAL_ARCHIVE"
-        rm -- "$ARCHIVE"
-    fi
-    ARCHIVE=$LOCAL_ARCHIVE
-fi
-
+# Keep the new archive in its original location until all hooks have completed. A failed
+# hook exits before the move below, leaving the input archive available for a rerun.
 info 'Archive applied'
 
 SETUP_STATUS='not run'
@@ -610,26 +629,14 @@ report() {
 }
 
 TEST_RAN_BY_SETUP=0
+TESTS_FLAG="$PROJECT_ROOT/.TESTS_FLAG"
 
-setup_trace_detected_test_hook() {
-    [[ -s $SETUP_TEST_TRACE_FILE ]] || return 1
-    local escaped_hook=${TEST_HOOK//./\.}
-    # BASH_XTRACEFD keeps setup's trace separate from normal output. Match the command
-    # position in the trace, not arbitrary occurrences of the hook filename.
-    grep -Eq \
-        "^\++[[:space:]]+(exec[[:space:]]+|command[[:space:]]+)?([A-Za-z_][A-Za-z0-9_]*=[^[:space:]]+[[:space:]]+)*([^[:space:]]*/)?${escaped_hook}([[:space:]]|$)" \
-        "$SETUP_TEST_TRACE_FILE" || \
-    grep -Eq \
-        "^\++[[:space:]]+(exec[[:space:]]+)?(bash|sh|dash|zsh|ksh)[[:space:]]+([^[:space:]]*/)?${escaped_hook}([[:space:]]|$)" \
-        "$SETUP_TEST_TRACE_FILE" || \
-    grep -Eq \
-        "^\++[[:space:]]+(source|\.)[[:space:]]+([^[:space:]]*/)?${escaped_hook}([[:space:]]|$)" \
-        "$SETUP_TEST_TRACE_FILE"
+setup_ran_test_hook() {
+    [[ -e $TESTS_FLAG ]]
 }
 TEST_RESULT_FILE=''
 TEST_HOOK_BACKUP=''
 TEST_HOOK_WRAPPER=''
-SETUP_TEST_TRACE_FILE=''
 restore_test_hook() {
     if [[ -n $TEST_HOOK_WRAPPER && -f $TEST_HOOK_WRAPPER ]]; then
         rm -f -- "$TEST_HOOK_WRAPPER"
@@ -638,16 +645,15 @@ restore_test_hook() {
         mv -f -- "$TEST_HOOK_BACKUP" "$PROJECT_ROOT/$TEST_HOOK"
     fi
     [[ -z $TEST_RESULT_FILE ]] || rm -f -- "$TEST_RESULT_FILE"
-    [[ -z $SETUP_TEST_TRACE_FILE ]] || rm -f -- "$SETUP_TEST_TRACE_FILE"
+    rm -f -- "$TESTS_FLAG"
 }
-
 if ((RUN_SETUP)); then
     trap restore_test_hook EXIT
-    SETUP_TEST_TRACE_FILE=$(mktemp "${TMPDIR:-/tmp}/patchzip-setup-trace.XXXXXX")
 fi
 
 
 if ((RUN_SETUP && RUN_TEST)); then
+    rm -f -- "$TESTS_FLAG"
     TEST_HOOK_BACKUP=$(mktemp "${TMPDIR:-/tmp}/patchzip-test-hook.XXXXXX")
     TEST_RESULT_FILE=$(mktemp "${TMPDIR:-/tmp}/patchzip-test-result.XXXXXX")
     TEST_HOOK_WRAPPER="$PROJECT_ROOT/$TEST_HOOK"
@@ -657,6 +663,7 @@ if ((RUN_SETUP && RUN_TEST)); then
 set +e
 wrapper="$TEST_HOOK_WRAPPER"
 original="$TEST_HOOK_BACKUP"
+: > "$TESTS_FLAG"
 mv -- "\$wrapper" "\${wrapper}.running"
 cp -- "\$original" "\$wrapper"
 if [[ \${BASH_SOURCE[0]} != "\$0" ]]; then
@@ -684,13 +691,13 @@ fi
 
 if ((RUN_SETUP)); then
     info 'Running setup.sh'
-    if (cd "$PROJECT_ROOT" && exec 9>"$SETUP_TEST_TRACE_FILE" && BASH_XTRACEFD=9 PS4='+patchzip: ' PATH="$HOOK_PATH" bash -x ./setup.sh); then
+    if (cd "$PROJECT_ROOT" && PATH="$HOOK_PATH" bash ./setup.sh); then
         SETUP_STATUS='passed'
         info 'setup.sh passed'
     else
         status=$?
         SETUP_STATUS="failed (exit $status)"
-        if ((RUN_TEST)) && setup_trace_detected_test_hook; then
+        if ((RUN_TEST)) && setup_ran_test_hook; then
             TEST_RAN_BY_SETUP=1
             if [[ -s $TEST_RESULT_FILE ]]; then
                 test_status=$(cat "$TEST_RESULT_FILE")
@@ -705,7 +712,7 @@ if ((RUN_SETUP)); then
         report 'failed'
         exit "$status"
     fi
-    if ((RUN_TEST)) && setup_trace_detected_test_hook; then
+    if ((RUN_TEST)) && setup_ran_test_hook; then
         TEST_RAN_BY_SETUP=1
         if [[ -s $TEST_RESULT_FILE ]]; then
             test_status=$(cat "$TEST_RESULT_FILE")
@@ -739,6 +746,16 @@ if ((RUN_TEST && TEST_RAN_BY_SETUP == 0)); then
         report 'failed'
         exit "$status"
     fi
+fi
+
+# Only after all hooks have completed successfully, retain the new archive in the project.
+# If a hook failed, control never reaches here and the source archive remains untouched.
+if [[ $ARCHIVE != "$LOCAL_ARCHIVE" ]]; then
+    if ! mv -f -- "$ARCHIVE" "$LOCAL_ARCHIVE" 2>/dev/null; then
+        cp -f -- "$ARCHIVE" "$LOCAL_ARCHIVE"
+        rm -- "$ARCHIVE"
+    fi
+    ARCHIVE=$LOCAL_ARCHIVE
 fi
 
 if [[ -n $MATCHING_OLD ]]; then

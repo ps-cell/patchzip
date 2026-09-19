@@ -170,6 +170,7 @@ setup_runs_bare_test_hook_once_test() {
     printf new > "$new/a"
     cat > "$new/run_tests.sh" <<'SH'
 #!/usr/bin/env bash
+[[ -e .TESTS_FLAG ]]
 printf test-ran >> test.out
 SH
     cat > "$d/setup.sh" <<'SH'
@@ -180,6 +181,7 @@ SH
     make_zip "$new" "$dl/project-v1.zip"
     (cd "$d" && "$BIN" "$dl/project-v1.zip" --yes >/dev/null)
     [[ $(cat "$d/test.out") == test-ran ]]
+    [[ ! -e "$d/.TESTS_FLAG" ]]
 }
 
 setup_runs_failing_tests_once_test() {
@@ -288,9 +290,13 @@ multiple_old_test() {
     mkdir -p "$d" "$dl" "$TMP/new8"
     printf new > "$TMP/new8/a"
     make_zip "$TMP/new8" "$dl/project-v2.zip"
-    : > "$d/project-v1.zip"
-    : > "$d/project-v0.9.zip"
-    ! (cd "$d" && "$BIN" "$dl/project-v2.zip" --yes --no-setup --no-test >/dev/null 2>&1)
+    printf old1 > "$d/project-v1.zip"
+    printf old09 > "$d/project-v0.9.zip"
+    (cd "$d" && "$BIN" "$dl/project-v2.zip" --yes --no-setup --no-test >/dev/null)
+    [[ -f "$d/project-v2.zip" ]]
+    [[ -f "$d/project-v1.zip" ]]
+    [[ ! -f "$d/project-v0.9.zip" ]]
+    [[ $(cat "$d/.patchdir/project-v1.zip") == old1 ]]
 }
 
 symlink_test() {
@@ -322,6 +328,7 @@ SH
     make_zip "$new" "$dl/project-v1.zip"
     (cd "$d" && "$BIN" "$dl/project-v1.zip" --yes >/dev/null)
     [[ $(cat "$d/test-runs.log") == exec-ran ]]
+    [[ ! -e "$d/.TESTS_FLAG" ]]
 }
 
 run_test setup_runs_exec_test_hook_once setup_runs_exec_test_hook_once_test
@@ -339,9 +346,28 @@ SH
     make_zip "$new" "$dl/project-v1.zip"
     (cd "$d" && "$BIN" "$dl/project-v1.zip" --yes >/dev/null)
     [[ $(cat "$d/test-runs.log") == legacy-ran ]]
+    [[ ! -e "$d/.TESTS_FLAG" ]]
 }
 
 run_test setup_runs_legacy_test_hook_once setup_runs_legacy_test_hook_once_test
+
+setup_hook_detection_ignores_bash_env_test() {
+    local d="$TMP/setup-hook-detection-bash-env" dl="$TMP/downloads-setup-hook-detection-bash-env" new="$TMP/new-setup-hook-detection-bash-env" env="$TMP/bash-env-setup-hook-detection"
+    mkdir -p "$d" "$dl" "$new"
+    printf new > "$new/a"
+    printf '#!/usr/bin/env bash\nprintf bash-env-ran >> test-runs.log\n' > "$new/run_tests.sh"
+    cat > "$d/setup.sh" <<'SH'
+#!/usr/bin/env bash
+set -e
+run_tests.sh
+SH
+    printf "PS4='CUSTOM-PS4: '\n" > "$env"
+    make_zip "$new" "$dl/project-v1.zip"
+    (cd "$d" && BASH_ENV="$env" "$BIN" "$dl/project-v1.zip" --yes >/dev/null)
+    [[ $(cat "$d/test-runs.log") == bash-env-ran ]]
+}
+
+run_test setup_hook_detection_ignores_bash_env setup_hook_detection_ignores_bash_env_test
 
 setup_failure_after_test_hook_test() {
     local d="$TMP/setup-failure-after-test-hook" dl="$TMP/downloads-setup-failure-after-test-hook" new="$TMP/new-setup-failure-after-test-hook"
@@ -359,6 +385,22 @@ SH
 }
 
 run_test setup_failure_after_test_hook setup_failure_after_test_hook_test
+
+setup_hook_failure_cleans_tests_flag_test() {
+    local d="$TMP/setup-hook-failure-cleans-tests-flag" dl="$TMP/downloads-setup-hook-failure-cleans-tests-flag" new="$TMP/new-setup-hook-failure-cleans-tests-flag"
+    mkdir -p "$d" "$dl" "$new"
+    printf new > "$new/a"
+    printf '#!/usr/bin/env bash\n[[ -e .TESTS_FLAG ]]\nexit 23\n' > "$new/run_tests.sh"
+    cat > "$d/setup.sh" <<'SH'
+#!/usr/bin/env bash
+./run_tests.sh
+SH
+    make_zip "$new" "$dl/project-v1.zip"
+    ! (cd "$d" && "$BIN" "$dl/project-v1.zip" --yes >/dev/null 2>&1)
+    [[ ! -e "$d/.TESTS_FLAG" ]]
+}
+
+run_test setup_hook_failure_cleans_tests_flag setup_hook_failure_cleans_tests_flag_test
 
 run_test setup_runs_failing_tests_once setup_runs_failing_tests_once_test
 run_test test_failure test_failure_test
@@ -576,7 +618,7 @@ self_patch_test() {
     mkdir -p "$d" "$dl" "$new" "$bin"
     cp "$BIN" "$d/patchzip"
     cp "$BIN" "$new/patchzip"
-    sed -i "s/VERSION='0.4.20'/VERSION='0.4.1'/" "$new/patchzip"
+    sed -i "s/VERSION='0.4.24'/VERSION='0.4.1'/" "$new/patchzip"
     printf 'old\n' > "$d/payload.txt"
     printf 'new\n' > "$new/payload.txt"
     ln -s "$d/patchzip" "$bin/patchzip"
@@ -666,6 +708,78 @@ duplicate_download_suffix_test() {
 }
 
 run_test duplicate_download_suffix duplicate_download_suffix_test
+
+duplicate_existing_archive_suffix_test() {
+    local d="$TMP/dupe-existing" dl="$TMP/downloads-dupe-existing" new="$TMP/new-dupe-existing"
+    mkdir -p "$d" "$dl" "$new"
+    printf old > "$d/a"
+    printf oldzip > "$d/project-v1(1).zip"
+    printf new > "$new/a"
+    make_zip "$new" "$dl/project-v2.zip"
+    local output
+    output=$(cd "$d" && "$BIN" "$dl/project-v2.zip" --yes --no-setup --no-test)
+    [[ $(cat "$d/a") == new ]]
+    [[ -f "$d/project-v2.zip" ]]
+    [[ ! -f "$d/project-v1(1).zip" ]]
+    [[ -f "$d/.patchdir/project-v1(1).zip" ]]
+    [[ $output == *'Retired ZIP:   project-v1(1).zip'* ]]
+}
+
+run_test duplicate_existing_archive_suffix duplicate_existing_archive_suffix_test
+
+
+new_archive_lifecycle_test() {
+    local d="$TMP/new-archive-lifecycle" dl="$TMP/downloads-new-archive-lifecycle" new="$TMP/new-new-archive-lifecycle"
+    mkdir -p "$d" "$dl" "$new"
+    printf old > "$d/a"
+    printf oldzip > "$d/project-v1.zip"
+    printf new > "$new/a"
+    cat > "$d/setup.sh" <<'SH'
+#!/usr/bin/env bash
+[[ -f ../downloads-new-archive-lifecycle/project-v2.zip ]] 2>/dev/null || true
+[[ -f project-v2.zip ]] && exit 41
+[[ -f "$PWD/../downloads-new-archive-lifecycle/project-v2.zip" ]] || exit 42
+printf setup-ran > setup.out
+SH
+    make_zip "$new" "$dl/project-v2.zip"
+    (cd "$d" && "$BIN" "$dl/project-v2.zip" --yes >/dev/null)
+    [[ -f "$d/project-v2.zip" ]]
+    [[ ! -f "$dl/project-v2.zip" ]]
+    [[ -f "$d/.patchdir/project-v1.zip" ]]
+
+    printf newer > "$new/a"
+    cat > "$d/setup.sh" <<'SH'
+#!/usr/bin/env bash
+exit 23
+SH
+    make_zip "$new" "$dl/project-v3.zip"
+    if (cd "$d" && "$BIN" "$dl/project-v3.zip" --yes >/dev/null 2>&1); then
+        return 1
+    fi
+    [[ -f "$dl/project-v3.zip" ]]
+    [[ ! -f "$d/project-v3.zip" ]]
+}
+
+run_test new_archive_lifecycle new_archive_lifecycle_test
+
+multiple_historical_archives_test() {
+    local d="$TMP/multiple-historical" dl="$TMP/downloads-multiple-historical" new="$TMP/new-multiple-historical" output
+    mkdir -p "$d" "$dl" "$new"
+    printf old > "$d/a"
+    printf v13 > "$d/librarian-v0.4.13.zip"
+    printf v15 > "$d/librarian-v0.4.15.zip"
+    printf new > "$new/a"
+    make_zip "$new" "$dl/librarian-v0.4.16.zip"
+    output=$(cd "$d" && "$BIN" "$dl/librarian-v0.4.16.zip" --yes --no-setup --no-test)
+    [[ $(cat "$d/a") == new ]]
+    [[ -f "$d/librarian-v0.4.16.zip" ]]
+    [[ -f "$d/librarian-v0.4.13.zip" ]]
+    [[ ! -f "$d/librarian-v0.4.15.zip" ]]
+    [[ $(cat "$d/.patchdir/librarian-v0.4.15.zip") == v15 ]]
+    [[ $output != *'multiple possible old project archives'* ]]
+}
+
+run_test multiple_historical_archives multiple_historical_archives_test
 run_test version_suffix version_suffix_test
 
 
@@ -1049,7 +1163,7 @@ install_test() {
     [[ $(readlink -f "$home/.local/bin/patchzip") == "$(readlink -f "$ROOT/patchzip")" ]]
     [[ -L "$home/.local/bin/pzip" ]]
     [[ $(readlink "$home/.local/bin/pzip") == patchzip ]]
-    [[ $(HOME="$home" "$home/.local/bin/patchzip" --version) == 0.4.20 ]]
+    [[ $(HOME="$home" "$home/.local/bin/patchzip" --version) == 0.4.24 ]]
 }
 
 run_test user_local_install install_test

@@ -9,11 +9,8 @@ The coding agent and your environment stay separated by a deliberate boundary: *
 The agent prepares a release ZIP. You run one command:
 
 ```bash
-cd /path/to/your/project
-pzip
+pzip project-v-1.2.3.zip
 ```
-
-When you run without any arguments `patchzip` tries to automatically find a fitting archive in your `~/Downloads`, based on the name of `pwd` and the found `*.zip` files. 
 
 `patchzip` validates it, applies it to the project, runs the project's setup/tests, and reports the result. The agent never needs access to your filesystem, shell, or computer.
 
@@ -49,16 +46,6 @@ Useful options:
     --version   Show version
 ```
 
-## The patch
-
-Archives are applied at the project root. They may contain the project files directly or one top-level directory matching the project name.
-
-Before changing the project, patchzip validates the archive and rejects unsafe paths and symbolic links. Files in the project that are not in the patch are left alone.
-
-If the project contains `setup.sh`, `run_tests.sh`, or `run_test.sh`, patchzip can run the appropriate hooks after applying the patch. Their output is passed through unchanged; patchzip does not try to detect or manage arbitrary test frameworks.
-
-When an older project release ZIP is replaced successfully, patchzip keeps it in `.patchdir/` as a local backup.
-
 ## Instructions for your coding agent
 
 If an AI coding agent maintains a project using patchzip, store these rules in its persistent project memory:
@@ -68,8 +55,26 @@ If an AI coding agent maintains a project using patchzip, store these rules in i
 > > - Deliver releases as `<project>-v-<version>.zip`.
 > > - Put files at their project-root paths; do not add an enclosing release directory.
 > > - The user applies releases with `patchzip`/`pzip`; do not instruct them to manually unzip files.
-> > - Keep `setup.sh` and the project test hook `run_tests.sh` authoritative.
+> > - Keep `setup.sh` and the project test hook authoritative.
 > > - Keep releases clean: no generated archives, caches, or unrelated build files.
+> > - Keep patchzip integration simple and deterministic.
+
+## The patch
+
+Archives are applied at the project root. They may contain the project files directly or one top-level directory matching the project name.
+
+Before changing the project, patchzip validates the archive and rejects unsafe paths and symbolic links. Files in the project that are not in the patch are left alone.
+
+If the project contains `setup.sh`, `run_tests.sh`, or `run_test.sh`, patchzip can run the appropriate hooks after applying the patch. If `setup.sh` invokes the configured test hook itself, patchzip detects that invocation through a temporary internal marker and does not run the hook a second time. The marker is removed during cleanup. Their output is passed through unchanged; patchzip does not try to detect or manage arbitrary test frameworks.
+
+The input release ZIP remains in its original location (normally `~/Downloads`) until all configured hooks have completed successfully. If a hook fails, the input ZIP is left there so the same archive can be rerun. Only after all configured hooks pass is the new ZIP moved into the project root. Existing release ZIPs are treated as historical archives rather than competing inputs: when several versions are present, the highest matching version is retired into `.patchdir/`. Patchzip keeps exactly one ZIP backup there—the most recently retired one—and replaces the previous backup on the next successful release. In `--git` mode, `.patchdir/` is deliberately excluded from the commit and remains outside the committed tree. Browser download suffixes such as `(1)` are ignored when identifying versions, while the actual filename is preserved when an archive is retired.
+
+## Git mode
+
+`--git` is deliberately simple: it requires a clean worktree, creates a `patchzip/<archive-stem>` branch, applies the patch, runs the normal setup/test flow, and commits the result.
+
+It does not push, create pull requests, merge, rebase, or stash.
+
 
 ## Installation
 
@@ -81,7 +86,7 @@ The installer creates `patchzip` and `pzip` symlinks in `~/.local/bin` and does 
 
 ## Requirements
 
-GNU/Linux, Bash 4+, and:
+GNU/Linux, Bash 4.4+, and:
 
 - `unzip`
 - `zipinfo`
