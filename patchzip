@@ -1,0 +1,784 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+VERSION='0.4.20'
+SCRIPT_NAME='patchzip'
+
+usage() {
+    cat <<USAGE
+Usage: $SCRIPT_NAME [OPTIONS] [ARCHIVE]
+
+Apply an in-place project ZIP archive, then run project hooks.
+
+With no ARCHIVE, ZIP candidates are taken from ~/Downloads.
+
+Options:
+  -y, --yes       Apply without asking for confirmation
+  -n, --dry-run   Show what would happen without changing anything
+      --no-setup  Do not run setup.sh
+      --no-test   Do not run run_tests.sh or run_test.sh
+      --git       Create a branch and commit the applied patch
+  -h, --help      Show this help
+      --version   Show version
+USAGE
+}
+
+if [[ -t 1 && -z ${NO_COLOR:-} ]]; then
+    RED=$'\033[31m'
+    GREEN=$'\033[32m'
+    YELLOW=$'\033[33m'
+    BOLD=$'\033[1m'
+    RESET=$'\033[0m'
+else
+    RED=''
+    GREEN=''
+    YELLOW=''
+    BOLD=''
+    RESET=''
+fi
+say() { printf '%s\n' "$*"; }
+fatal() { printf '%s%s%s%s\n' "$RED" 'patchzip: error: ' "$*" "$RESET" >&2; exit 1; }
+info() { printf '→ %s\n' "$*"; }
+success() { printf '%s%s%s\n' "$GREEN" '✓ ' "$*"; }
+warning() { printf '%s%s%s\n' "$YELLOW" '⚠ ' "$*" >&2; }
+
+DRY_RUN=0
+ASSUME_YES=0
+NO_SETUP=0
+NO_TEST=0
+GIT_MODE=0
+ARCHIVE_ARG=''
+
+while (($#)); do
+    case $1 in
+        -y|--yes) ASSUME_YES=1 ;;
+        -n|--dry-run) DRY_RUN=1 ;;
+        --no-setup) NO_SETUP=1 ;;
+        --no-test) NO_TEST=1 ;;
+        --git) GIT_MODE=1 ;; 
+        -h|--help) usage; exit 0 ;;
+        --version) printf '%s\n' "$VERSION"; exit 0 ;;
+        --) shift; (($# <= 1)) || fatal 'only one archive may be supplied'; ARCHIVE_ARG=${1-}; break ;;
+        -*) fatal "unknown option: $1" ;;
+        *) [[ -z $ARCHIVE_ARG ]] || fatal 'only one archive may be supplied'; ARCHIVE_ARG=$1 ;;
+    esac
+    shift
+done
+
+PROJECT_ROOT=$(pwd -P)
+[[ -d $PROJECT_ROOT ]] || fatal 'current directory is not accessible'
+
+GIT_ROOT=''
+GIT_BRANCH=''
+GIT_COMMITTED=0
+if ((GIT_MODE)); then
+    GIT_ROOT=$(git -C "$PROJECT_ROOT" rev-parse --show-toplevel 2>/dev/null) || fatal '--git requires the current project to be inside a Git worktree'
+    [[ "$GIT_ROOT" == "$PROJECT_ROOT" ]] || fatal '--git requires the current directory to be the Git worktree root'
+    [[ -z $(git -C "$PROJECT_ROOT" status --porcelain) ]] || fatal '--git requires a clean Git working tree'
+fi
+
+command -v unzip >/dev/null 2>&1 || fatal 'unzip is required'
+command -v zipinfo >/dev/null 2>&1 || fatal 'zipinfo is required'
+command -v mktemp >/dev/null 2>&1 || fatal 'mktemp is required'
+command -v cp >/dev/null 2>&1 || fatal 'cp is required'
+command -v readlink >/dev/null 2>&1 || fatal 'readlink is required'
+command -v cmp >/dev/null 2>&1 || fatal 'cmp is required'
+if ((GIT_MODE)); then
+    command -v git >/dev/null 2>&1 || fatal 'git is required for --git'
+fi
+
+is_zip() {
+    [[ -f $1 ]] && unzip -tqq -- "$1" >/dev/null 2>&1
+}
+
+select_archive() {
+    if [[ -n $ARCHIVE_ARG ]]; then
+        if [[ $ARCHIVE_ARG == */* ]]; then
+            printf '%s\n' "$(cd "$(dirname -- "$ARCHIVE_ARG")" && pwd -P)/$(basename -- "$ARCHIVE_ARG")"
+        else
+            printf '%s\n' "$PROJECT_ROOT/$ARCHIVE_ARG"
+        fi
+        return
+    fi
+
+    local downloads=${HOME}/Downloads
+    [[ -d $downloads ]] || fatal "Downloads directory does not exist: $downloads"
+    mapfile -d '' candidates < <(find "$downloads" -maxdepth 1 -type f -iname '*.zip' -print0 | sort -z)
+    ((${#candidates[@]})) || fatal "no ZIP archives found in $downloads"
+
+    local project_name
+    project_name=$(basename -- "$PROJECT_ROOT")
+    local project_name_match=${project_name,,}
+    local -a matching=()
+    local candidate base base_match stem identity prefix prefix_match
+    for candidate in "${candidates[@]}"; do
+        base=$(basename -- "$candidate")
+        stem=${base%.*}
+        # Ignore browser download collision suffixes such as '(1)'.
+        identity=$stem
+        if [[ $identity =~ ^(.+)\([0-9]+\)$ ]]; then
+            identity=${BASH_REMATCH[1]}
+        fi
+        prefix=$identity
+        if [[ $prefix =~ ^(.+[-_])v-?[0-9]+([.][0-9]+)*([-_].*)?$ ]]; then
+            prefix=${BASH_REMATCH[1]}
+        elif [[ $prefix =~ ^([^0-9]+)[0-9]+([.][0-9]+)*$ ]]; then
+            prefix=${BASH_REMATCH[1]}
+        fi
+        base_match=${base,,}
+        prefix_match=${prefix,,}
+
+        # Usually the archive starts with the project name, but repositories may
+        # live in a parent/namespace name, e.g. project 'agent-runtime' with
+        # archive 'jeb-agent-runtime-v0.5.11.zip'. Match either side.
+        if [[ $base_match == "$project_name_match"-* || $base_match == "$project_name_match"_* ||
+              $base_match == "$project_name_match".* || $base_match == "$project_name_match".zip ||
+              $prefix_match == *"-${project_name_match}-" || $prefix_match == *"_${project_name_match}-" ||
+              $prefix_match == *".${project_name_match}-" || $prefix_match == *"/${project_name_match}-" ||
+              $prefix_match == *"-${project_name_match}_" || $prefix_match == *"_${project_name_match}_" ||
+              $prefix_match == *".${project_name_match}_" || $prefix_match == *"/${project_name_match}_" ]]; then
+            matching+=("$candidate")
+        fi
+    done
+
+    if ((${#matching[@]} == 1)); then
+        printf '%s\n' "${matching[0]}"
+        return
+    fi
+    if ((${#matching[@]} == 0 && ${#candidates[@]} == 1)); then
+        printf '%s\n' "${candidates[0]}"
+        return
+    fi
+    if ((${#matching[@]} > 1)); then
+        candidates=("${matching[@]}")
+    fi
+
+    say 'ZIP archives found in ~/Downloads:' >&2
+    local i=1
+    for candidate in "${candidates[@]}"; do
+        printf '  %d) %s\n' "$i" "$(basename -- "$candidate")" >&2
+        ((i++))
+    done
+
+    local choice
+    while :; do
+        read -r -p 'Select archive [1-'$((i-1))']: ' choice || fatal 'input cancelled'
+        [[ $choice =~ ^[0-9]+$ ]] && ((choice >= 1 && choice < i)) && break
+        say 'Please enter a valid selection.' >&2
+    done
+    printf '%s\n' "${candidates[choice-1]}"
+}
+
+ARCHIVE=$(select_archive)
+[[ -f $ARCHIVE ]] || fatal "archive does not exist: $ARCHIVE"
+ARCHIVE=$(cd "$(dirname -- "$ARCHIVE")" && pwd -P)/$(basename -- "$ARCHIVE")
+is_zip "$ARCHIVE" || fatal "not a valid ZIP archive: $ARCHIVE"
+
+ARCHIVE_BASE=$(basename -- "$ARCHIVE")
+ARCHIVE_STEM=${ARCHIVE_BASE%.*}
+# Browser downloaders commonly append '(1)', '(2)', etc. when a file is downloaded
+# more than once. Ignore that suffix for project/archive identity matching.
+ARCHIVE_ID_STEM=$ARCHIVE_STEM
+if [[ $ARCHIVE_ID_STEM =~ ^(.+)\([0-9]+\)$ ]]; then
+    ARCHIVE_ID_STEM=${BASH_REMATCH[1]}
+fi
+ARCHIVE_PROJECT=''
+ARCHIVE_VERSIONED=0
+if [[ $ARCHIVE_ID_STEM =~ ^(.+)-v-?([0-9]+([.][0-9]+)*)$ ]]; then
+    ARCHIVE_PROJECT=${BASH_REMATCH[1]}
+    ARCHIVE_VERSIONED=1
+fi
+
+MATCHING_OLD=''
+shopt -s nullglob
+for candidate in "$PROJECT_ROOT"/*.zip "$PROJECT_ROOT"/*.ZIP; do
+    [[ -f $candidate ]] || continue
+    [[ "$(basename -- "$candidate")" == "$ARCHIVE_BASE" ]] && continue
+    base=$(basename -- "$candidate")
+    base_stem=${base%.*}
+    if ((ARCHIVE_VERSIONED)); then
+        candidate_project=''
+        if [[ $base_stem =~ ^(.+)-v-?([0-9]+([.][0-9]+)*)$ ]]; then
+            candidate_project=${BASH_REMATCH[1]}
+        fi
+        [[ -n $candidate_project && ${candidate_project,,} == ${ARCHIVE_PROJECT,,} ]] || continue
+    else
+        # Without the project-v[-]<version>.zip convention, keep the old prefix
+        # matching as a deliberately conservative fallback.
+        fallback_prefix=$ARCHIVE_ID_STEM
+        if [[ $fallback_prefix =~ ^(.+[-_])v-?[0-9]+([.][0-9]+)*([-_].*)?$ ]]; then
+            fallback_prefix=${BASH_REMATCH[1]}
+        elif [[ $fallback_prefix =~ ^([^0-9]+)[0-9]+([.][0-9]+)*$ ]]; then
+            fallback_prefix=${BASH_REMATCH[1]}
+        fi
+        [[ ${base_stem,,} == "${fallback_prefix,,}"* ]] || continue
+    fi
+
+    if [[ -z $MATCHING_OLD ]]; then
+        MATCHING_OLD=$candidate
+    else
+        fatal "multiple possible old project archives: $(basename -- "$MATCHING_OLD") and $(basename -- "$candidate")"
+    fi
+done
+shopt -u nullglob
+
+# Read and validate the archive directly. There is deliberately no project-tree staging.
+# A ZIP may either contain project-root paths or exactly one top-level wrapper directory.
+mapfile -t ZIP_ENTRIES < <(zipinfo -1 -- "$ARCHIVE")
+
+if symlink_entry=$(zipinfo -l -- "$ARCHIVE" | awk '$1 ~ /^l/ {print; exit}'); then
+    [[ -z $symlink_entry ]] || fatal 'unsafe ZIP archive: symbolic links are not supported'
+fi
+
+# Determine whether every archive entry lives below exactly one top-level directory.
+# This handles common nested archives such as patchzip/patchzip without guessing recursively.
+top_level=''
+top_level_count=0
+for member in "${ZIP_ENTRIES[@]}"; do
+    [[ -n $member ]] || continue
+    clean=${member#./}
+    while [[ $clean == */ ]]; do clean=${clean%/}; done
+    [[ -n $clean ]] || continue
+    first=${clean%%/*}
+    if [[ $first != "$clean" ]]; then
+        if [[ -z $top_level ]]; then
+            top_level=$first
+            top_level_count=1
+        elif [[ $top_level != "$first" ]]; then
+            top_level_count=2
+        fi
+    else
+        top_level_count=2
+    fi
+done
+
+ARCHIVE_LAYOUT='project-root'
+ARCHIVE_PREFIX=''
+if ((top_level_count == 1)); then
+    # A sole directory is only treated as a wrapper when its name identifies this
+    # project. Otherwise a legitimate archive containing one project directory
+    # (for example .venv/) would be silently flattened.
+    wrapper_matches_project=0
+    project_name=$(basename -- "$PROJECT_ROOT")
+    if [[ ${top_level,,} == ${project_name,,} ]]; then
+        wrapper_matches_project=1
+    elif ((ARCHIVE_VERSIONED)) && [[ ${top_level,,} == ${ARCHIVE_PROJECT,,} ]]; then
+        wrapper_matches_project=1
+    fi
+    if ((wrapper_matches_project)); then
+        ARCHIVE_PREFIX="$top_level"
+        ARCHIVE_LAYOUT="nested ($ARCHIVE_PREFIX/)"
+    fi
+fi
+
+# Validate every archive member after applying the optional one-level wrapper prefix.
+# This catches ancestor conflicts before extraction instead of leaving unzip to produce
+# an opaque file/directory error.
+declare -A ARCHIVE_TYPES=()
+declare -A ARCHIVE_MEMBERS=()
+FILE_COUNT=0
+CONFLICT_COUNT=0
+CONFLICT_SAMPLE=()
+while IFS= read -r member; do
+    [[ -n $member ]] || continue
+    [[ $member != /* ]] || fatal "unsafe ZIP entry (absolute path): $member"
+
+    is_dir=0
+    [[ $member == */ ]] && is_dir=1
+    normalized=${member#./}
+    while [[ $normalized == */ ]]; do normalized=${normalized%/}; done
+    [[ -n $normalized ]] || continue
+
+    IFS='/' read -r -a parts <<< "$normalized"
+    clean_parts=()
+    for part in "${parts[@]}"; do
+        case $part in
+            ''|.) ;;
+            ..) fatal "unsafe ZIP entry (path traversal): $member" ;;
+            *) clean_parts+=("$part") ;;
+        esac
+    done
+    ((${#clean_parts[@]} > 0)) || fatal "unsafe ZIP entry (empty path): $member"
+    normalized=$(IFS=/; printf '%s' "${clean_parts[*]}")
+
+    if [[ -n $ARCHIVE_PREFIX ]]; then
+        [[ $normalized == "$ARCHIVE_PREFIX" || $normalized == "$ARCHIVE_PREFIX/"* ]] || \
+            fatal "invalid nested ZIP layout: entry outside '$ARCHIVE_PREFIX/': $normalized"
+        if [[ $normalized == "$ARCHIVE_PREFIX" ]]; then
+            continue
+        fi
+        normalized=${normalized#"$ARCHIVE_PREFIX/"}
+        [[ -n $normalized ]] || continue
+    fi
+
+    if [[ -n ${ARCHIVE_TYPES[$normalized]+x} ]]; then
+        [[ ${ARCHIVE_TYPES[$normalized]} == "$is_dir" ]] || fatal "conflicting ZIP entries for path: $normalized"
+        fatal "duplicate ZIP entry: $normalized"
+    fi
+    ARCHIVE_TYPES[$normalized]=$is_dir
+    ARCHIVE_MEMBERS[$normalized]=$member
+
+    prefix=''
+    IFS='/' read -r -a target_parts <<< "$normalized"
+    for part in "${target_parts[@]}"; do
+        if [[ -n $prefix ]]; then prefix+="/"; fi
+        prefix+="$part"
+        [[ $prefix == "$normalized" ]] && break
+        if [[ -e "$PROJECT_ROOT/$prefix" || -L "$PROJECT_ROOT/$prefix" ]]; then
+            [[ -d "$PROJECT_ROOT/$prefix" && ! -L "$PROJECT_ROOT/$prefix" ]] || \
+                fatal "file/directory conflict: archive path '$normalized' is blocked by project file '$prefix'"
+        fi
+    done
+
+    target="$PROJECT_ROOT/$normalized"
+    if [[ $is_dir == 1 ]]; then
+        if [[ -e $target || -L $target ]]; then
+            [[ -d $target && ! -L $target ]] || fatal "file/directory conflict: archive contains directory '$normalized', but project contains a file"
+        fi
+    else
+        FILE_COUNT=$((FILE_COUNT + 1))
+        if [[ -e $target || -L $target ]]; then
+            [[ ! -L $target ]] || fatal "unsafe project path: archive would overwrite symbolic link '$normalized'"
+            [[ ! -d $target ]] || fatal "file/directory conflict: archive contains file '$normalized', but project contains a directory"
+            CONFLICT_COUNT=$((CONFLICT_COUNT + 1))
+            if ((${#CONFLICT_SAMPLE[@]} < 8)); then CONFLICT_SAMPLE+=("$normalized"); fi
+        fi
+    fi
+done < <(printf '%s\n' "${ZIP_ENTRIES[@]}")
+
+for normalized in "${!ARCHIVE_TYPES[@]}"; do
+    IFS='/' read -r -a parts <<< "$normalized"
+    prefix=''
+    for ((i=0; i<${#parts[@]}-1; i++)); do
+        if [[ -n $prefix ]]; then prefix+="/"; fi
+        prefix+="${parts[i]}"
+        if [[ ${ARCHIVE_TYPES[$prefix]+x} && ${ARCHIVE_TYPES[$prefix]} != 1 ]]; then
+            fatal "conflicting ZIP entries: '$prefix' is a file but '$normalized' is nested below it"
+        fi
+    done
+done
+
+NEW_FILE_COUNT=$((FILE_COUNT - CONFLICT_COUNT))
+
+# Hooks may already exist in the project or arrive at the project root in the archive.
+RUN_SETUP=0
+RUN_TEST=0
+TEST_HOOK=''
+if ((NO_SETUP == 0)) && { [[ -f "$PROJECT_ROOT/setup.sh" ]] || [[ -n ${ARCHIVE_TYPES[setup.sh]+x} ]]; }; then
+    RUN_SETUP=1
+fi
+if ((NO_TEST == 0)); then
+    if [[ -n ${ARCHIVE_TYPES[run_tests.sh]+x} || -f "$PROJECT_ROOT/run_tests.sh" ]]; then
+        RUN_TEST=1
+        TEST_HOOK='run_tests.sh'
+    elif [[ -n ${ARCHIVE_TYPES[run_test.sh]+x} || -f "$PROJECT_ROOT/run_test.sh" ]]; then
+        RUN_TEST=1
+        TEST_HOOK='run_test.sh'
+    fi
+fi
+
+HOOK_PERMISSION_FIXES=()
+for hook in setup.sh run_tests.sh run_test.sh; do
+    candidate="$PROJECT_ROOT/$hook"
+    if [[ -f "$candidate" && ! -x "$candidate" ]]; then
+        HOOK_PERMISSION_FIXES+=("$hook")
+    fi
+done
+
+info "Applying $(basename -- "$ARCHIVE")"
+[[ -n $MATCHING_OLD ]] && info "Replacing old archive: $(basename -- "$MATCHING_OLD")"
+info "Extracting into: $PROJECT_ROOT"
+if ((RUN_SETUP)); then info 'Will run setup.sh'; fi
+if ((RUN_TEST)); then info "Will run $TEST_HOOK"; fi
+for hook in "${HOOK_PERMISSION_FIXES[@]}"; do info "Will fix executable permission: $hook"; done
+
+if ((DRY_RUN)); then
+    printf '\n'
+    printf 'Dry-run report\n'
+    printf '  Archive:       %s\n' "$ARCHIVE_BASE"
+    printf '  Layout:        %s\n' "$ARCHIVE_LAYOUT"
+    printf '  Files in ZIP:  %d\n' "$FILE_COUNT"
+    printf '  Replaces:      %d file(s)\n' "$CONFLICT_COUNT"
+    printf '  Adds:          %d file(s)\n' "$NEW_FILE_COUNT"
+    if [[ -n $MATCHING_OLD ]]; then
+        printf '  Retires ZIP:   %s (after successful hooks)\n' "$(basename -- "$MATCHING_OLD")"
+    else
+        printf '  Removes ZIP:   none\n'
+    fi
+    if ((RUN_SETUP || RUN_TEST)); then
+        local_hooks=''
+        ((RUN_SETUP)) && local_hooks='setup.sh'
+        if ((RUN_TEST)); then
+            [[ -n $local_hooks ]] && local_hooks+=', '
+            local_hooks+=$TEST_HOOK
+        fi
+        printf '  Hooks:         %s\n' "$local_hooks"
+    else
+        printf '  Hooks:         none\n'
+    fi
+    if ((${#HOOK_PERMISSION_FIXES[@]})); then
+        printf '  Hook perms:    %d fix(es)\n' "${#HOOK_PERMISSION_FIXES[@]}"
+    fi
+    printf '  Result:        no changes made\n'
+    exit 0
+fi
+
+LOCAL_ARCHIVE="$PROJECT_ROOT/$ARCHIVE_BASE"
+ARCHIVE_DEST_EXISTS=0
+if [[ -e $LOCAL_ARCHIVE || -L $LOCAL_ARCHIVE ]]; then
+    ARCHIVE_DEST_EXISTS=1
+fi
+
+# If the archive replaces the script that is currently executing, move the running inode aside
+# before extraction. Bash may read a script incrementally, so overwriting its pathname in place can
+# make it continue reading unrelated bytes from the new file.
+RUNNING_SCRIPT=$(readlink -f -- "${BASH_SOURCE[0]}")
+SELF_TARGET_REL=''
+SELF_BACKUP=''
+SELF_MOVED=0
+if [[ -f $RUNNING_SCRIPT && $RUNNING_SCRIPT == "$PROJECT_ROOT"/* ]]; then
+    SELF_TARGET_REL=${RUNNING_SCRIPT#"$PROJECT_ROOT"/}
+fi
+
+if ((GIT_MODE)); then
+    GIT_BRANCH="patchzip/$ARCHIVE_STEM"
+    git -C "$PROJECT_ROOT" check-ref-format --branch "$GIT_BRANCH" >/dev/null 2>&1 || fatal "invalid Git branch name derived from archive: $GIT_BRANCH"
+    git -C "$PROJECT_ROOT" show-ref --verify --quiet "refs/heads/$GIT_BRANCH" && fatal "Git branch already exists: $GIT_BRANCH"
+fi
+
+confirm_apply() {
+    ((ASSUME_YES)) && return 0
+    [[ -t 0 && -t 2 ]] || fatal 'confirmation required; use -y/--yes for non-interactive use'
+
+    printf '\n'
+    if ((CONFLICT_COUNT > 0)); then
+        printf 'This will overwrite %d existing project file(s).\n' "$CONFLICT_COUNT" >&2
+        local item
+        for item in "${CONFLICT_SAMPLE[@]}"; do
+            printf '  • %s\n' "$item" >&2
+        done
+        if ((CONFLICT_COUNT > ${#CONFLICT_SAMPLE[@]})); then
+            printf '  … and %d more\n' "$((CONFLICT_COUNT - ${#CONFLICT_SAMPLE[@]}))" >&2
+        fi
+    else
+        printf 'No existing project files will be overwritten.\n' >&2
+    fi
+    printf 'Archive layout: %s\n' "$ARCHIVE_LAYOUT" >&2
+    if ((ARCHIVE_DEST_EXISTS)); then
+        printf '%sThe archive %s will be replaced in the project.%s\n' "$BOLD" "$ARCHIVE_BASE" "$RESET" >&2
+    else
+        printf '%sThe archive %s will be added to the project.%s\n' "$BOLD" "$ARCHIVE_BASE" "$RESET" >&2
+    fi
+    if [[ -n $MATCHING_OLD ]]; then
+        printf 'The old archive %s will be retired after successful hooks.\n' "$(basename -- "$MATCHING_OLD")" >&2
+    fi
+    printf '\nContinue? [Y/n] ' >&2
+    local answer
+    read -r answer || return 1
+    case $answer in
+        ''|y|Y|yes|YES|Yes) return 0 ;;
+        *) return 1 ;;
+    esac
+}
+
+confirm_apply || { say 'Cancelled. No changes made.' >&2; exit 0; }
+
+if ((GIT_MODE)); then
+    git -C "$PROJECT_ROOT" switch -c "$GIT_BRANCH" >/dev/null || fatal "could not create Git branch: $GIT_BRANCH"
+    info "Created Git branch: $GIT_BRANCH"
+fi
+
+PATCHDIR_BACKUP=''
+OLD_ARCHIVE_RETIRED=0
+
+if [[ -n $SELF_TARGET_REL && ${ARCHIVE_TYPES[$SELF_TARGET_REL]+x} ]]; then
+    SELF_BACKUP=$(mktemp "${TMPDIR:-/tmp}/patchzip-running.XXXXXX")
+    rm -f -- "$SELF_BACKUP"
+    mv -- "$RUNNING_SCRIPT" "$SELF_BACKUP"
+    SELF_MOVED=1
+fi
+
+# Apply the validated archive directly to the project. Root-level archives can use unzip
+# normally. For a one-level wrapper, extract each file through unzip -p so the wrapper directory
+# itself is never created in the project. This keeps extraction direct and avoids a staging tree.
+extract_archive() {
+    if [[ -z $ARCHIVE_PREFIX ]]; then
+        unzip -oq -- "$ARCHIVE" -d "$PROJECT_ROOT"
+        return
+    fi
+
+    local normalized member target dir mode perms
+    for normalized in "${!ARCHIVE_TYPES[@]}"; do
+        member=${ARCHIVE_MEMBERS[$normalized]}
+        target="$PROJECT_ROOT/$normalized"
+        if [[ ${ARCHIVE_TYPES[$normalized]} == 1 ]]; then
+            mkdir -p -- "$target"
+            continue
+        fi
+        dir=$(dirname -- "$target")
+        mkdir -p -- "$dir"
+        unzip -p -- "$ARCHIVE" "$member" > "$target"
+
+        # Preserve the archive's basic Unix permission bits. zipinfo's first field is
+        # an ls-style mode string (e.g. -rwxr-xr-x); convert its rwx bits to octal.
+        mode=$(zipinfo -l -- "$ARCHIVE" "$member" | awk 'NR==1 {print $1}')
+        perms=0
+        [[ ${mode:1:1} == r ]] && perms=$((perms + 400))
+        [[ ${mode:2:1} == w ]] && perms=$((perms + 200))
+        [[ ${mode:3:1} == x ]] && perms=$((perms + 100))
+        [[ ${mode:4:1} == r ]] && perms=$((perms + 40))
+        [[ ${mode:5:1} == w ]] && perms=$((perms + 20))
+        [[ ${mode:6:1} == x ]] && perms=$((perms + 10))
+        [[ ${mode:7:1} == r ]] && perms=$((perms + 4))
+        [[ ${mode:8:1} == w ]] && perms=$((perms + 2))
+        [[ ${mode:9:1} == x ]] && perms=$((perms + 1))
+        chmod "$perms" -- "$target"
+    done
+}
+
+if ! extract_archive; then
+    if ((SELF_MOVED)); then
+        rm -f -- "$PROJECT_ROOT/$SELF_TARGET_REL"
+        mv -- "$SELF_BACKUP" "$PROJECT_ROOT/$SELF_TARGET_REL"
+        SELF_MOVED=0
+    fi
+    fatal 'could not extract archive into project'
+fi
+if ((SELF_MOVED)); then
+    rm -f -- "$SELF_BACKUP"
+    SELF_BACKUP=''
+    SELF_MOVED=0
+fi
+
+for hook in "${HOOK_PERMISSION_FIXES[@]}"; do
+    chmod +x -- "$PROJECT_ROOT/$hook"
+    info "fixed executable permission: $hook"
+done
+
+# Place the new archive in the project, matching the established workflow. mv may cross
+# filesystems, so fall back to cp+rm.
+if [[ $ARCHIVE != "$LOCAL_ARCHIVE" ]]; then
+    if ! mv -f -- "$ARCHIVE" "$LOCAL_ARCHIVE" 2>/dev/null; then
+        cp -f -- "$ARCHIVE" "$LOCAL_ARCHIVE"
+        rm -- "$ARCHIVE"
+    fi
+    ARCHIVE=$LOCAL_ARCHIVE
+fi
+
+info 'Archive applied'
+
+SETUP_STATUS='not run'
+TEST_STATUS='not run'
+
+report() {
+    local result=$1
+    printf '\n'
+    printf 'Patch report\n'
+    printf '  Archive:       %s\n' "$ARCHIVE_BASE"
+    printf '  Layout:        %s\n' "$ARCHIVE_LAYOUT"
+    printf '  Files in ZIP:  %d\n' "$FILE_COUNT"
+    printf '  Replaces:      %d file(s)\n' "$CONFLICT_COUNT"
+    printf '  Adds:          %d file(s)\n' "$NEW_FILE_COUNT"
+    if ((OLD_ARCHIVE_RETIRED)); then
+        printf '  Retired ZIP:   %s\n' "$(basename -- "$MATCHING_OLD")"
+        printf '  Backup:        .patchdir/%s\n' "$BACKUP_BASENAME"
+    fi
+    if ((GIT_MODE)); then
+        printf '  Git branch:    %s\n' "$GIT_BRANCH"
+        if ((GIT_COMMITTED)); then printf '  Git commit:    yes\n'; else printf '  Git commit:    no\n'; fi
+    fi
+    if [[ $SETUP_STATUS == passed* ]]; then
+        printf '  Setup:         %s%s%s\n' "$GREEN" "$SETUP_STATUS" "$RESET"
+    elif [[ $SETUP_STATUS == failed* ]]; then
+        printf '  Setup:         %s%s%s\n' "$RED" "$SETUP_STATUS" "$RESET"
+    else
+        printf '  Setup:         %s\n' "$SETUP_STATUS"
+    fi
+    if [[ $TEST_STATUS == passed* ]]; then
+        printf '  Tests:         %s%s%s\n' "$GREEN" "$TEST_STATUS" "$RESET"
+    elif [[ $TEST_STATUS == failed* ]]; then
+        printf '  Tests:         %s%s%s\n' "$RED" "$TEST_STATUS" "$RESET"
+    else
+        printf '  Tests:         %s\n' "$TEST_STATUS"
+    fi
+    if ((${#HOOK_PERMISSION_FIXES[@]})); then printf '  Hook perms:    %d fixed\n' "${#HOOK_PERMISSION_FIXES[@]}"; fi
+    if [[ $result == success ]]; then
+        printf '  Result:        %s%s%s\n' "$GREEN" "$result" "$RESET"
+    else
+        printf '  Result:        %s%s%s\n' "$RED" "$result" "$RESET"
+    fi
+}
+
+TEST_RAN_BY_SETUP=0
+
+setup_trace_detected_test_hook() {
+    [[ -s $SETUP_TEST_TRACE_FILE ]] || return 1
+    local escaped_hook=${TEST_HOOK//./\.}
+    # BASH_XTRACEFD keeps setup's trace separate from normal output. Match the command
+    # position in the trace, not arbitrary occurrences of the hook filename.
+    grep -Eq \
+        "^\++[[:space:]]+(exec[[:space:]]+|command[[:space:]]+)?([A-Za-z_][A-Za-z0-9_]*=[^[:space:]]+[[:space:]]+)*([^[:space:]]*/)?${escaped_hook}([[:space:]]|$)" \
+        "$SETUP_TEST_TRACE_FILE" || \
+    grep -Eq \
+        "^\++[[:space:]]+(exec[[:space:]]+)?(bash|sh|dash|zsh|ksh)[[:space:]]+([^[:space:]]*/)?${escaped_hook}([[:space:]]|$)" \
+        "$SETUP_TEST_TRACE_FILE" || \
+    grep -Eq \
+        "^\++[[:space:]]+(source|\.)[[:space:]]+([^[:space:]]*/)?${escaped_hook}([[:space:]]|$)" \
+        "$SETUP_TEST_TRACE_FILE"
+}
+TEST_RESULT_FILE=''
+TEST_HOOK_BACKUP=''
+TEST_HOOK_WRAPPER=''
+SETUP_TEST_TRACE_FILE=''
+restore_test_hook() {
+    if [[ -n $TEST_HOOK_WRAPPER && -f $TEST_HOOK_WRAPPER ]]; then
+        rm -f -- "$TEST_HOOK_WRAPPER"
+    fi
+    if [[ -n $TEST_HOOK_BACKUP && -f $TEST_HOOK_BACKUP ]]; then
+        mv -f -- "$TEST_HOOK_BACKUP" "$PROJECT_ROOT/$TEST_HOOK"
+    fi
+    [[ -z $TEST_RESULT_FILE ]] || rm -f -- "$TEST_RESULT_FILE"
+    [[ -z $SETUP_TEST_TRACE_FILE ]] || rm -f -- "$SETUP_TEST_TRACE_FILE"
+}
+
+if ((RUN_SETUP)); then
+    trap restore_test_hook EXIT
+    SETUP_TEST_TRACE_FILE=$(mktemp "${TMPDIR:-/tmp}/patchzip-setup-trace.XXXXXX")
+fi
+
+
+if ((RUN_SETUP && RUN_TEST)); then
+    TEST_HOOK_BACKUP=$(mktemp "${TMPDIR:-/tmp}/patchzip-test-hook.XXXXXX")
+    TEST_RESULT_FILE=$(mktemp "${TMPDIR:-/tmp}/patchzip-test-result.XXXXXX")
+    TEST_HOOK_WRAPPER="$PROJECT_ROOT/$TEST_HOOK"
+    mv -- "$TEST_HOOK_WRAPPER" "$TEST_HOOK_BACKUP"
+    cat > "$TEST_HOOK_WRAPPER" <<EOF
+#!/usr/bin/env bash
+set +e
+wrapper="$TEST_HOOK_WRAPPER"
+original="$TEST_HOOK_BACKUP"
+mv -- "\$wrapper" "\${wrapper}.running"
+cp -- "\$original" "\$wrapper"
+if [[ \${BASH_SOURCE[0]} != "\$0" ]]; then
+    source "\$wrapper"
+    status=\$?
+else
+    bash "\$wrapper" "\$@"
+    status=\$?
+fi
+rm -f -- "\$wrapper"
+mv -- "\${wrapper}.running" "\$wrapper"
+printf '%s\n' "\$status" > "$TEST_RESULT_FILE"
+if [[ \${BASH_SOURCE[0]} != "\$0" ]]; then
+    return "\$status"
+fi
+exit "\$status"
+EOF
+    chmod +x -- "$TEST_HOOK_WRAPPER"
+fi
+
+HOOK_PATH="$PROJECT_ROOT:$PATH"
+if [[ -d "$PROJECT_ROOT/.venv/bin" ]]; then
+    HOOK_PATH="$PROJECT_ROOT/.venv/bin:$HOOK_PATH"
+fi
+
+if ((RUN_SETUP)); then
+    info 'Running setup.sh'
+    if (cd "$PROJECT_ROOT" && exec 9>"$SETUP_TEST_TRACE_FILE" && BASH_XTRACEFD=9 PS4='+patchzip: ' PATH="$HOOK_PATH" bash -x ./setup.sh); then
+        SETUP_STATUS='passed'
+        info 'setup.sh passed'
+    else
+        status=$?
+        SETUP_STATUS="failed (exit $status)"
+        if ((RUN_TEST)) && setup_trace_detected_test_hook; then
+            TEST_RAN_BY_SETUP=1
+            if [[ -s $TEST_RESULT_FILE ]]; then
+                test_status=$(cat "$TEST_RESULT_FILE")
+                TEST_STATUS="failed (exit $test_status; run by setup.sh)"
+            else
+                TEST_STATUS="not verified (run by setup.sh; setup exit $status)"
+            fi
+        else
+            TEST_STATUS='not run (setup failed)'
+        fi
+        printf '%s✗ setup.sh failed (exit %d)%s\n' "$RED" "$status" "$RESET" >&2
+        report 'failed'
+        exit "$status"
+    fi
+    if ((RUN_TEST)) && setup_trace_detected_test_hook; then
+        TEST_RAN_BY_SETUP=1
+        if [[ -s $TEST_RESULT_FILE ]]; then
+            test_status=$(cat "$TEST_RESULT_FILE")
+            if ((test_status == 0)); then
+                TEST_STATUS='passed (run by setup.sh)'
+                info 'tests passed (run by setup.sh)'
+            else
+                TEST_STATUS="failed (exit $test_status; run by setup.sh)"
+                printf '%s✗ %s failed (exit %d; run by setup.sh)%s\n' "$RED" "$TEST_HOOK" "$test_status" "$RESET" >&2
+                printf '%sArchive was applied successfully, but tests failed.%s\n' "$YELLOW" "$RESET" >&2
+                report 'failed'
+                exit "$test_status"
+            fi
+        else
+            TEST_STATUS='passed (run by setup.sh)'
+            info 'tests passed (run by setup.sh)'
+        fi
+    fi
+fi
+
+if ((RUN_TEST && TEST_RAN_BY_SETUP == 0)); then
+    info "Running $TEST_HOOK"
+    if (cd "$PROJECT_ROOT" && PATH="$HOOK_PATH" bash "./$TEST_HOOK"); then
+        TEST_STATUS='passed'
+        info 'tests passed'
+    else
+        status=$?
+        TEST_STATUS="failed (exit $status)"
+        printf '%s✗ %s failed (exit %d)%s\n' "$RED" "$TEST_HOOK" "$status" >&2
+        printf '%sArchive was applied successfully, but tests failed.%s\n' "$YELLOW" "$RESET" >&2
+        report 'failed'
+        exit "$status"
+    fi
+fi
+
+if [[ -n $MATCHING_OLD ]]; then
+    PATCHDIR="$PROJECT_ROOT/.patchdir"
+    if ((ARCHIVE_VERSIONED)); then
+        BACKUP_BASENAME=$(basename -- "$MATCHING_OLD")
+    else
+        BACKUP_BASENAME=previous-version.zip
+    fi
+    PATCHDIR_BACKUP="$PATCHDIR/$BACKUP_BASENAME"
+    mkdir -p -- "$PATCHDIR"
+    BACKUP_TEMP=$(mktemp "$PATCHDIR/.backup.XXXXXX")
+    if ! cp -f -- "$MATCHING_OLD" "$BACKUP_TEMP"; then
+        rm -f -- "$BACKUP_TEMP"
+        fatal 'could not back up old archive after successful hooks'
+    fi
+    if ! cmp -s -- "$MATCHING_OLD" "$BACKUP_TEMP"; then
+        rm -f -- "$BACKUP_TEMP"
+        fatal 'old archive backup verification failed'
+    fi
+    find "$PATCHDIR" -maxdepth 1 -type f -name '*.zip' -delete
+    if ! mv -f -- "$BACKUP_TEMP" "$PATCHDIR_BACKUP"; then
+        rm -f -- "$BACKUP_TEMP"
+        fatal "could not install old archive backup: .patchdir/$BACKUP_BASENAME"
+    fi
+    rm -- "$MATCHING_OLD"
+    OLD_ARCHIVE_RETIRED=1
+    info "Replaced old archive: $(basename -- "$MATCHING_OLD") → .patchdir/$BACKUP_BASENAME"
+fi
+
+if ((GIT_MODE)); then
+    git -C "$PROJECT_ROOT" add -A -- . ':(exclude).patchdir'
+    if git -C "$PROJECT_ROOT" diff --cached --quiet; then
+        fatal 'nothing to commit after applying archive'
+    fi
+    git -C "$PROJECT_ROOT" commit -m "Apply $ARCHIVE_BASE" >/dev/null || fatal 'Git commit failed'
+    GIT_COMMITTED=1
+    info "Committed patch: Apply $ARCHIVE_BASE"
+fi
+
+report 'success'
+
+success 'Done.'
