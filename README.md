@@ -61,17 +61,11 @@ If an AI coding agent maintains a project using patchzip, store these rules in i
 
 ## The patch
 
-Archives are applied at the project root. They may contain the project files directly or one top-level directory matching the project name.
+Archives are applied at the project root (or from one matching top-level directory). Before changing anything, patchzip validates the archive, rejects unsafe paths and symbolic links, and leaves files not included in the patch untouched.
 
-Before changing the project, patchzip validates the archive and rejects unsafe paths and symbolic links. Files in the project that are not in the patch are left alone.
+After applying the patch, patchzip can run `setup.sh` and the project test hook (`run_tests.sh` or `run_test.sh`). If `setup.sh` invokes that test hook itself, patchzip detects it and avoids running it twice. Hook output is passed through unchanged.
 
-If the project contains `setup.sh`, `run_tests.sh`, or `run_test.sh`, patchzip can run the appropriate hooks after applying the patch. If `setup.sh` invokes the configured test hook itself, patchzip detects that invocation through a temporary internal marker and does not run the hook a second time. The marker is removed during cleanup. Their output is passed through unchanged; patchzip does not try to detect or manage arbitrary test frameworks.
-
-Before changing the project, patchzip validates the archive. It then shows the upgrade transition immediately before the existing confirmation point, using only version information that is actually available. If the incoming archive's project name differs from the target directory name, it also prints a prominent factual mismatch warning; the warning does not alter archive selection or application behavior.
-
-The input release ZIP remains in its original location (normally `~/Downloads`) until all configured hooks have completed successfully. If a configured hook fails, the input ZIP is discarded because the project has already been modified and the failed archive is not retained as a rerun candidate. On success, the new ZIP is moved into the project root, and older matching versioned release ZIPs still in `~/Downloads` are removed as stale inputs. Same-version duplicates and unrelated ZIPs are left alone. Existing release ZIPs are treated as historical archives rather than competing inputs: when several versions are present, the highest matching version is retired into `.patchdir/`. Browser download suffixes such as `(1)` are ignored when identifying versions, while the actual filename is preserved when an archive is retired.
-
-With `--git`, the project must be the root of a clean Git worktree with an `origin` remote. The derived target branch must not already exist locally **or on `origin`**. Git finalization is deliberately deferred until **all configured hooks have passed**. Only then does patchzip create `patchzip/<archive-stem>` with `git switch -c`, stage all changes except `.patchdir`, commit with `Apply <archive>`, and run `git push -u origin <branch>`. Git authentication and prompts are handled by native Git. A failed hook creates no branch or commit; a commit failure leaves the local branch intact; and a push failure leaves the local branch and commit intact so the push can be retried manually. `--dry-run` never creates, stages, commits, or pushes Git state.
+The input ZIP is retained until all hooks succeed; a failed hook discards it, while a successful run moves it into the project root and cleans up stale matching downloads. Older matching releases are retired into `.patchdir/`. With `--git`, Git finalization happens only after the hooks pass: patchzip creates a new branch, stages the project changes except `.patchdir`, commits, and pushes it. Failures leave existing Git state recoverable, and `--dry-run` makes no Git changes.
 
 ## Installation
 
