@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-VERSION='0.4.24'
+VERSION='0.4.26'
 SCRIPT_NAME='patchzip'
 
 usage() {
@@ -183,9 +183,11 @@ if [[ $ARCHIVE_ID_STEM =~ ^(.+)\([0-9]+\)$ ]]; then
     ARCHIVE_ID_STEM=${BASH_REMATCH[1]}
 fi
 ARCHIVE_PROJECT=''
+ARCHIVE_VERSION=''
 ARCHIVE_VERSIONED=0
 if [[ $ARCHIVE_ID_STEM =~ ^(.+)-v-?([0-9]+([.][0-9]+)*)$ ]]; then
     ARCHIVE_PROJECT=${BASH_REMATCH[1]}
+    ARCHIVE_VERSION=${BASH_REMATCH[2]}
     ARCHIVE_VERSIONED=1
 fi
 
@@ -582,8 +584,19 @@ for hook in "${HOOK_PERMISSION_FIXES[@]}"; do
     info "fixed executable permission: $hook"
 done
 
-# Keep the new archive in its original location until all hooks have completed. A failed
-# hook exits before the move below, leaving the input archive available for a rerun.
+# Keep the new archive in its original location until all hooks have completed. If a
+# configured hook fails, the source archive is deliberately discarded: the project has
+# already been modified and the failed archive is no longer a valid rerun candidate.
+discard_failed_input_archive() {
+    [[ $ARCHIVE != "$LOCAL_ARCHIVE" ]] || return 0
+    [[ -e $ARCHIVE ]] || return 0
+    if rm -f -- "$ARCHIVE"; then
+        info "Discarded failed input archive: $ARCHIVE_BASE"
+    else
+        printf '%sWarning: could not discard failed input archive: %s%s\n' "$YELLOW" "$ARCHIVE" "$RESET" >&2
+    fi
+}
+
 info 'Archive applied'
 
 SETUP_STATUS='not run'
@@ -709,6 +722,7 @@ if ((RUN_SETUP)); then
             TEST_STATUS='not run (setup failed)'
         fi
         printf '%s✗ setup.sh failed (exit %d)%s\n' "$RED" "$status" "$RESET" >&2
+        discard_failed_input_archive
         report 'failed'
         exit "$status"
     fi
@@ -723,6 +737,7 @@ if ((RUN_SETUP)); then
                 TEST_STATUS="failed (exit $test_status; run by setup.sh)"
                 printf '%s✗ %s failed (exit %d; run by setup.sh)%s\n' "$RED" "$TEST_HOOK" "$test_status" "$RESET" >&2
                 printf '%sArchive was applied successfully, but tests failed.%s\n' "$YELLOW" "$RESET" >&2
+                discard_failed_input_archive
                 report 'failed'
                 exit "$test_status"
             fi
@@ -743,13 +758,14 @@ if ((RUN_TEST && TEST_RAN_BY_SETUP == 0)); then
         TEST_STATUS="failed (exit $status)"
         printf '%s✗ %s failed (exit %d)%s\n' "$RED" "$TEST_HOOK" "$status" >&2
         printf '%sArchive was applied successfully, but tests failed.%s\n' "$YELLOW" "$RESET" >&2
+        discard_failed_input_archive
         report 'failed'
         exit "$status"
     fi
 fi
 
 # Only after all hooks have completed successfully, retain the new archive in the project.
-# If a hook failed, control never reaches here and the source archive remains untouched.
+# If a hook failed, its source archive was discarded and control never reaches here.
 if [[ $ARCHIVE != "$LOCAL_ARCHIVE" ]]; then
     if ! mv -f -- "$ARCHIVE" "$LOCAL_ARCHIVE" 2>/dev/null; then
         cp -f -- "$ARCHIVE" "$LOCAL_ARCHIVE"
@@ -757,6 +773,42 @@ if [[ $ARCHIVE != "$LOCAL_ARCHIVE" ]]; then
     fi
     ARCHIVE=$LOCAL_ARCHIVE
 fi
+
+cleanup_download_archives() {
+    ((ARCHIVE_VERSIONED)) || return 0
+    local downloads=${HOME}/Downloads
+    [[ -d $downloads ]] || return 0
+
+    local candidate base stem identity candidate_project candidate_version
+    local -a stale=()
+    shopt -s nullglob
+    for candidate in "$downloads"/*.zip "$downloads"/*.ZIP; do
+        [[ -f $candidate ]] || continue
+        base=$(basename -- "$candidate")
+        stem=${base%.*}
+        identity=$stem
+        if [[ $identity =~ ^(.+)\([0-9]+\)$ ]]; then
+            identity=${BASH_REMATCH[1]}
+        fi
+        if [[ $identity =~ ^(.+)-v-?([0-9]+([.][0-9]+)*)$ ]]; then
+            candidate_project=${BASH_REMATCH[1]}
+            candidate_version=${BASH_REMATCH[2]}
+        else
+            continue
+        fi
+        [[ ${candidate_project,,} == ${ARCHIVE_PROJECT,,} ]] || continue
+        [[ $candidate_version != "$ARCHIVE_VERSION" ]] || continue
+        if [[ "$(printf '%s\n' "$candidate_version" "$ARCHIVE_VERSION" | sort -V | tail -n1)" == "$ARCHIVE_VERSION" ]]; then
+            stale+=("$candidate")
+        fi
+    done
+    shopt -u nullglob
+
+    for candidate in "${stale[@]}"; do
+        rm -f -- "$candidate"
+        info "Removed stale Downloads archive: $(basename -- "$candidate")"
+    done
+}
 
 if [[ -n $MATCHING_OLD ]]; then
     PATCHDIR="$PROJECT_ROOT/.patchdir"
@@ -785,6 +837,11 @@ if [[ -n $MATCHING_OLD ]]; then
     OLD_ARCHIVE_RETIRED=1
     info "Replaced old archive: $(basename -- "$MATCHING_OLD") → .patchdir/$BACKUP_BASENAME"
 fi
+
+# Once a versioned release has been applied successfully, older matching releases
+# left in Downloads are stale inputs. Remove only lower-version archives belonging
+# to this project; same-version duplicates and unrelated ZIPs are left untouched.
+cleanup_download_archives
 
 if ((GIT_MODE)); then
     git -C "$PROJECT_ROOT" add -A -- . ':(exclude).patchdir'

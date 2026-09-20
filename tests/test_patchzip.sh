@@ -618,7 +618,7 @@ self_patch_test() {
     mkdir -p "$d" "$dl" "$new" "$bin"
     cp "$BIN" "$d/patchzip"
     cp "$BIN" "$new/patchzip"
-    sed -i "s/VERSION='0.4.24'/VERSION='0.4.1'/" "$new/patchzip"
+    sed -i "s/VERSION='0.4.26'/VERSION='0.4.1'/" "$new/patchzip"
     printf 'old\n' > "$d/payload.txt"
     printf 'new\n' > "$new/payload.txt"
     ln -s "$d/patchzip" "$bin/patchzip"
@@ -756,11 +756,59 @@ SH
     if (cd "$d" && "$BIN" "$dl/project-v3.zip" --yes >/dev/null 2>&1); then
         return 1
     fi
-    [[ -f "$dl/project-v3.zip" ]]
+    [[ ! -f "$dl/project-v3.zip" ]]
     [[ ! -f "$d/project-v3.zip" ]]
+    [[ -f "$d/a" ]]
+    [[ $(cat "$d/a") == newer ]]
 }
 
 run_test new_archive_lifecycle new_archive_lifecycle_test
+
+failed_test_hook_discards_input_test() {
+    local d="$TMP/failed-test-hook-discards-input" dl="$TMP/downloads-failed-test-hook" new="$TMP/new-failed-test-hook"
+    mkdir -p "$d" "$dl" "$new"
+    printf old > "$d/a"
+    printf new > "$new/a"
+    cat > "$d/run_tests.sh" <<'SH'
+#!/usr/bin/env bash
+exit 37
+SH
+    make_zip "$new" "$dl/project-v4.zip"
+    if (cd "$d" && "$BIN" "$dl/project-v4.zip" --yes --no-setup >/dev/null 2>&1); then
+        return 1
+    fi
+    [[ ! -f "$dl/project-v4.zip" ]]
+    [[ ! -f "$d/project-v4.zip" ]]
+    [[ $(cat "$d/a") == new ]]
+}
+
+run_test failed_test_hook_discards_input failed_test_hook_discards_input_test
+
+cleanup_stale_download_archives_test() {
+    local d="$TMP/cleanup-stale-downloads" dl="$TMP/home-cleanup-stale/Downloads" new="$TMP/new-cleanup-stale" output
+    mkdir -p "$d" "$dl" "$new"
+    printf old > "$d/a"
+    printf new > "$new/a"
+    make_zip "$new" "$dl/project-v0.4.24.zip"
+    make_zip "$new" "$dl/project-v0.4.23.zip"
+    make_zip "$new" "$dl/project-v0.4.22(1).zip"
+    make_zip "$new" "$dl/project-v0.4.25.zip"
+    make_zip "$new" "$dl/other-v0.1.zip"
+    make_zip "$new" "$dl/project-v0.4.24(1).zip"
+
+    output=$(cd "$d" && HOME="$TMP/home-cleanup-stale" "$BIN" "$dl/project-v0.4.24.zip" --yes --no-setup --no-test)
+    [[ -f "$d/project-v0.4.24.zip" ]]
+    [[ ! -f "$dl/project-v0.4.24.zip" ]]
+    [[ ! -f "$dl/project-v0.4.23.zip" ]]
+    [[ ! -f "$dl/project-v0.4.22(1).zip" ]]
+    [[ -f "$dl/project-v0.4.25.zip" ]]
+    [[ -f "$dl/other-v0.1.zip" ]]
+    [[ -f "$dl/project-v0.4.24(1).zip" ]]
+    [[ $output == *'Removed stale Downloads archive: project-v0.4.23.zip'* ]]
+    [[ $output == *'Removed stale Downloads archive: project-v0.4.22(1).zip'* ]]
+}
+
+run_test cleanup_stale_download_archives cleanup_stale_download_archives_test
 
 multiple_historical_archives_test() {
     local d="$TMP/multiple-historical" dl="$TMP/downloads-multiple-historical" new="$TMP/new-multiple-historical" output
@@ -1163,7 +1211,7 @@ install_test() {
     [[ $(readlink -f "$home/.local/bin/patchzip") == "$(readlink -f "$ROOT/patchzip")" ]]
     [[ -L "$home/.local/bin/pzip" ]]
     [[ $(readlink "$home/.local/bin/pzip") == patchzip ]]
-    [[ $(HOME="$home" "$home/.local/bin/patchzip" --version) == 0.4.24 ]]
+    [[ $(HOME="$home" "$home/.local/bin/patchzip" --version) == 0.4.26 ]]
 }
 
 run_test user_local_install install_test
