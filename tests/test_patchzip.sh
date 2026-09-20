@@ -634,7 +634,7 @@ self_patch_test() {
     mkdir -p "$d" "$dl" "$new" "$bin"
     cp "$BIN" "$d/patchzip"
     cp "$BIN" "$new/patchzip"
-    sed -i "s/VERSION='0.4.28'/VERSION='0.4.1'/" "$new/patchzip"
+    sed -i "s/VERSION='0.4.32'/VERSION='0.4.1'/" "$new/patchzip"
     printf 'old\n' > "$d/payload.txt"
     printf 'new\n' > "$new/payload.txt"
     ln -s "$d/patchzip" "$bin/patchzip"
@@ -1145,7 +1145,7 @@ run_test report_status_colors report_status_colors_test
 git_mode_test() {
     local d="$TMP/git-mode" dl="$TMP/downloads-git-mode" new="$TMP/new-git-mode"
     mkdir -p "$d" "$dl" "$new"
-    (cd "$d" && git init -q && git config user.email test@example.invalid && git config user.name Test)
+    (cd "$d" && git init -q && git config user.email test@example.invalid && git config user.name Test && git init --bare "$d-origin.git" -q && git remote add origin "$d-origin.git")
     printf old > "$d/a"
     (cd "$d" && git add a && git commit -qm initial)
     printf new > "$new/a"
@@ -1162,7 +1162,7 @@ run_test git_mode git_mode_test
 git_mode_existing_branch_test() {
     local d="$TMP/git-existing-branch" dl="$TMP/downloads-git-existing-branch" new="$TMP/new-git-existing-branch"
     mkdir -p "$d" "$dl" "$new"
-    (cd "$d" && git init -q && git config user.email test@example.invalid && git config user.name Test)
+    (cd "$d" && git init -q && git config user.email test@example.invalid && git config user.name Test && git init --bare "$d-origin.git" -q && git remote add origin "$d-origin.git")
     printf old > "$d/a"
     (cd "$d" && git add a && git commit -qm initial && git branch patchzip/project-v2)
     printf new > "$new/a"
@@ -1177,7 +1177,7 @@ run_test git_mode_existing_branch git_mode_existing_branch_test
 git_mode_patchdir_excluded_test() {
     local d="$TMP/git-patchdir" dl="$TMP/downloads-git-patchdir" new="$TMP/new-git-patchdir"
     mkdir -p "$d" "$dl" "$new"
-    (cd "$d" && git init -q && git config user.email test@example.invalid && git config user.name Test)
+    (cd "$d" && git init -q && git config user.email test@example.invalid && git config user.name Test && git init --bare "$d-origin.git" -q && git remote add origin "$d-origin.git")
     printf old > "$d/a"
     printf previous-archive > "$d/project-v1.zip"
     (cd "$d" && git add a project-v1.zip && git commit -qm initial)
@@ -1194,7 +1194,7 @@ run_test git_mode_patchdir_excluded git_mode_patchdir_excluded_test
 git_mode_invalid_branch_test() {
     local d="$TMP/git-invalid-branch" dl="$TMP/downloads-git-invalid-branch" new="$TMP/new-git-invalid-branch"
     mkdir -p "$d" "$dl" "$new"
-    (cd "$d" && git init -q && git config user.email test@example.invalid && git config user.name Test)
+    (cd "$d" && git init -q && git config user.email test@example.invalid && git config user.name Test && git init --bare "$d-origin.git" -q && git remote add origin "$d-origin.git")
     printf old > "$d/a"
     (cd "$d" && git add a && git commit -qm initial)
     printf new > "$new/a"
@@ -1208,7 +1208,7 @@ run_test git_mode_invalid_branch git_mode_invalid_branch_test
 git_mode_dirty_test() {
     local d="$TMP/git-dirty" dl="$TMP/downloads-git-dirty" new="$TMP/new-git-dirty"
     mkdir -p "$d" "$dl" "$new"
-    (cd "$d" && git init -q && git config user.email test@example.invalid && git config user.name Test)
+    (cd "$d" && git init -q && git config user.email test@example.invalid && git config user.name Test && git init --bare "$d-origin.git" -q && git remote add origin "$d-origin.git")
     printf old > "$d/a"
     (cd "$d" && git add a && git commit -qm initial)
     printf dirty > "$d/a"
@@ -1221,6 +1221,154 @@ git_mode_dirty_test() {
 
 run_test git_mode_requires_clean_tree git_mode_dirty_test
 
+
+git_mode_hook_failure_no_branch_test() {
+    local d="$TMP/git-hook-failure" dl="$TMP/downloads-git-hook-failure" new="$TMP/new-git-hook-failure"
+    mkdir -p "$d" "$dl" "$new"
+    (cd "$d" && git init -q && git config user.email test@example.invalid && git config user.name Test && git init --bare "$d-origin.git" -q && git remote add origin "$d-origin.git")
+    printf old > "$d/a"
+    (cd "$d" && git add a && git commit -qm initial)
+    cat > "$d/setup.sh" <<'SH'
+#!/usr/bin/env bash
+exit 17
+SH
+    printf new > "$new/a"
+    make_zip "$new" "$dl/project-v2.zip"
+    if (cd "$d" && "$BIN" "$dl/project-v2.zip" --yes --git >/dev/null 2>&1); then return 1; fi
+    [[ $(cd "$d" && git branch --show-current) == master || $(cd "$d" && git branch --show-current) == main ]]
+    [[ $(cd "$d" && git branch --list 'patchzip/*') == '' ]]
+    [[ -z $(cd "$d" && git log --all --oneline --grep='Apply project-v2.zip') ]]
+}
+
+run_test git_mode_hook_failure_no_branch git_mode_hook_failure_no_branch_test
+
+git_mode_hook_changes_and_push_test() {
+    local d="$TMP/git-hook-changes" dl="$TMP/downloads-git-hook-changes" new="$TMP/new-git-hook-changes" upstream
+    mkdir -p "$d" "$dl" "$new"
+    (cd "$d" && git init -q && git config user.email test@example.invalid && git config user.name Test && git init --bare "$d-origin.git" -q && git remote add origin "$d-origin.git")
+    printf old > "$d/a"
+    printf '#!/usr/bin/env bash\nprintf generated > generated.txt\n' > "$d/setup.sh"
+    chmod +x "$d/setup.sh"
+    (cd "$d" && git add a setup.sh && git commit -qm initial)
+    printf new > "$new/a"
+    make_zip "$new" "$dl/project-v2.zip"
+    (cd "$d" && "$BIN" "$dl/project-v2.zip" --yes --git >/dev/null)
+    [[ $(cat "$d/generated.txt") == generated ]]
+    [[ $(cd "$d" && git show --format= --name-only HEAD | grep -Fx generated.txt) == generated.txt ]]
+    [[ -z $(cd "$d" && git show --format= --name-only HEAD | grep -F '.patchdir/') ]]
+    upstream=$(cd "$d" && git rev-parse --abbrev-ref --symbolic-full-name '@{upstream}')
+    [[ $upstream == origin/patchzip/project-v2 ]]
+    git --git-dir="$d-origin.git" rev-parse --verify refs/heads/patchzip/project-v2 >/dev/null
+}
+
+run_test git_mode_hook_changes_and_push git_mode_hook_changes_and_push_test
+
+git_mode_remote_branch_exists_test() {
+    local d="$TMP/git-remote-branch-exists" dl="$TMP/downloads-git-remote-branch-exists" new="$TMP/new-git-remote-branch-exists"
+    mkdir -p "$d" "$dl" "$new"
+    (cd "$d" && git init -q && git config user.email test@example.invalid && git config user.name Test && git init --bare "$d-origin.git" -q && git remote add origin "$d-origin.git")
+    printf old > "$d/a"
+    (cd "$d" && git add a && git commit -qm initial && git push -q -u origin HEAD:patchzip/project-v2)
+    printf new > "$new/a"
+    make_zip "$new" "$dl/project-v2.zip"
+    ! (cd "$d" && "$BIN" "$dl/project-v2.zip" --yes --no-setup --no-test --git >/dev/null 2>&1)
+    [[ $(cd "$d" && git branch --show-current) == master || $(cd "$d" && git branch --show-current) == main ]]
+    [[ $(cat "$d/a") == old ]]
+}
+
+run_test git_mode_remote_branch_exists git_mode_remote_branch_exists_test
+
+git_mode_push_failure_preserves_commit_test() {
+    local d="$TMP/git-push-failure" dl="$TMP/downloads-git-push-failure" new="$TMP/new-git-push-failure" commit
+    mkdir -p "$d" "$dl" "$new"
+    (cd "$d" && git init -q && git config user.email test@example.invalid && git config user.name Test && git init --bare "$d-origin.git" -q && git remote add origin "$d-origin.git")
+    printf old > "$d/a"
+    (cd "$d" && git add a && git commit -qm initial)
+    printf new > "$new/a"
+    make_zip "$new" "$dl/project-v2.zip"
+    # Make the named remote syntactically valid for preflight, then make the push fail.
+    (cd "$d" && git remote set-url origin "$d-origin-missing.git")
+    if (cd "$d" && "$BIN" "$dl/project-v2.zip" --yes --no-setup --no-test --git >/dev/null 2>&1); then return 1; fi
+    [[ $(cd "$d" && git branch --show-current) == patchzip/project-v2 ]]
+    commit=$(cd "$d" && git rev-parse HEAD)
+    [[ -n $commit ]]
+    [[ $(cd "$d" && git log -1 --pretty=%s) == 'Apply project-v2.zip' ]]
+}
+
+run_test git_mode_push_failure_preserves_commit git_mode_push_failure_preserves_commit_test
+
+git_mode_dry_run_no_side_effects_test() {
+    local d="$TMP/git-dry-run" dl="$TMP/downloads-git-dry-run" new="$TMP/new-git-dry-run"
+    mkdir -p "$d" "$dl" "$new"
+    (cd "$d" && git init -q && git config user.email test@example.invalid && git config user.name Test && git init --bare "$d-origin.git" -q && git remote add origin "$d-origin.git")
+    printf old > "$d/a"
+    (cd "$d" && git add a && git commit -qm initial)
+    printf new > "$new/a"
+    make_zip "$new" "$dl/project-v2.zip"
+    (cd "$d" && "$BIN" "$dl/project-v2.zip" --yes --git --dry-run >/dev/null)
+    [[ $(cd "$d" && git branch --show-current) == master || $(cd "$d" && git branch --show-current) == main ]]
+    [[ -z $(cd "$d" && git branch --list 'patchzip/*') ]]
+    [[ $(cat "$d/a") == old ]]
+}
+
+run_test git_mode_dry_run_no_side_effects git_mode_dry_run_no_side_effects_test
+
+
+upgrade_summary_test() {
+    local d="$TMP/upgrade-summary-project" dl="$TMP/downloads-upgrade-summary" new="$TMP/new-upgrade-summary" output
+    mkdir -p "$d" "$dl" "$new"
+    printf old > "$d/a"
+    printf oldzip > "$d/project-v1.zip"
+    printf new > "$new/a"
+    make_zip "$new" "$dl/project-v2.zip"
+    output=$(cd "$d" && "$BIN" "$dl/project-v2.zip" --yes --no-setup --no-test 2>&1)
+    [[ $output == *'  You are about to upgrade:'* ]]
+    [[ $output == *'    project: project'* ]]
+    [[ $output == *'    version: 1 → 2'* ]]
+    [[ $output != *'!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!'* ]]
+}
+
+run_test upgrade_summary upgrade_summary_test
+
+project_mismatch_warning_test() {
+    local d="$TMP/project-mismatch-target" dl="$TMP/downloads-project-mismatch" new="$TMP/new-project-mismatch" output
+    mkdir -p "$d" "$dl" "$new"
+    printf new > "$new/a"
+    make_zip "$new" "$dl/other-project-v2.zip"
+    output=$(cd "$d" && "$BIN" "$dl/other-project-v2.zip" --yes --no-setup --no-test 2>&1)
+    [[ $output == *'WARNING: PROJECT NAME MISMATCH'* ]]
+    [[ $output == *'Target directory:   project-mismatch-target'* ]]
+    [[ $output == *'Incoming archive:   other-project'* ]]
+    [[ $(cat "$d/a") == new ]]
+}
+
+run_test project_mismatch_warning project_mismatch_warning_test
+
+project_case_match_no_warning_test() {
+    local d="$TMP/Project-Case" dl="$TMP/downloads-project-case" new="$TMP/new-project-case" output
+    mkdir -p "$d" "$dl" "$new"
+    printf new > "$new/a"
+    make_zip "$new" "$dl/project-case-v2.zip"
+    output=$(cd "$d" && "$BIN" "$dl/project-case-v2.zip" --yes --no-setup --no-test 2>&1)
+    [[ $output != *'WARNING: PROJECT NAME MISMATCH'* ]]
+}
+
+run_test project_case_match_no_warning project_case_match_no_warning_test
+
+unversioned_upgrade_summary_test() {
+    local d="$TMP/unversioned-summary" dl="$TMP/downloads-unversioned-summary" new="$TMP/new-unversioned-summary" output
+    mkdir -p "$d" "$dl" "$new"
+    printf old > "$d/a"
+    printf oldzip > "$d/project-old.zip"
+    printf new > "$new/a"
+    make_zip "$new" "$dl/project-new.zip"
+    output=$(cd "$d" && "$BIN" "$dl/project-new.zip" --yes --no-setup --no-test 2>&1)
+    [[ $output == *'version: unknown'* ]]
+    [[ $output != *'version: '*→*' (new)'* ]]
+}
+
+run_test unversioned_upgrade_summary unversioned_upgrade_summary_test
+
 install_test() {
     local home="$TMP/install-home" pathdir="$TMP/install-path"
     rm -rf "$home" "$pathdir"
@@ -1230,7 +1378,7 @@ install_test() {
     [[ $(readlink -f "$home/.local/bin/patchzip") == "$(readlink -f "$ROOT/patchzip")" ]]
     [[ -L "$home/.local/bin/pzip" ]]
     [[ $(readlink "$home/.local/bin/pzip") == patchzip ]]
-    [[ $(HOME="$home" "$home/.local/bin/patchzip" --version) == 0.4.28 ]]
+    [[ $(HOME="$home" "$home/.local/bin/patchzip" --version) == 0.4.32 ]]
 }
 
 run_test user_local_install install_test

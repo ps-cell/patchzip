@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-VERSION='0.4.28'
+VERSION='0.4.32'
 SCRIPT_NAME='patchzip'
 
 usage() {
@@ -17,7 +17,7 @@ Options:
   -n, --dry-run   Show what would happen without changing anything
       --no-setup  Do not run setup.sh
       --no-test   Do not run run_tests.sh or run_test.sh
-      --git       Create a branch and commit the applied patch
+      --git       After hooks pass, create a branch, commit the patch, and push it
   -h, --help      Show this help
       --version   Show version
 USAGE
@@ -75,6 +75,7 @@ if ((GIT_MODE)); then
     GIT_ROOT=$(git -C "$PROJECT_ROOT" rev-parse --show-toplevel 2>/dev/null) || fatal '--git requires the current project to be inside a Git worktree'
     [[ "$GIT_ROOT" == "$PROJECT_ROOT" ]] || fatal '--git requires the current directory to be the Git worktree root'
     [[ -z $(git -C "$PROJECT_ROOT" status --porcelain) ]] || fatal '--git requires a clean Git working tree'
+    git -C "$PROJECT_ROOT" remote get-url origin >/dev/null 2>&1 || fatal '--git requires a Git remote named origin'
 fi
 
 command -v unzip >/dev/null 2>&1 || fatal 'unzip is required'
@@ -417,8 +418,43 @@ done
 info "Applying $(basename -- "$ARCHIVE")"
 [[ -n $MATCHING_OLD ]] && info "Replacing old archive: $(basename -- "$MATCHING_OLD")"
 info "Extracting into: $PROJECT_ROOT"
+
+print_upgrade_summary() {
+    printf '\n'
+    printf '  You are about to upgrade:\n'
+    if [[ -n $ARCHIVE_PROJECT ]]; then
+        printf '    project: %s\n' "$ARCHIVE_PROJECT"
+    else
+        printf '    project: unknown\n'
+    fi
+    if [[ -n $MATCHING_OLD_VERSION && -n $ARCHIVE_VERSION ]]; then
+        printf '    version: %s%s%s → %s%s%s\n' \
+            "$BOLD" "$MATCHING_OLD_VERSION" "$RESET" \
+            "$BOLD" "$ARCHIVE_VERSION" "$RESET"
+    elif [[ -n $ARCHIVE_VERSION ]]; then
+        printf '    version: %s%s%s (new)\n' "$BOLD" "$ARCHIVE_VERSION" "$RESET"
+    elif [[ -n $MATCHING_OLD_VERSION ]]; then
+        printf '    version: %s%s%s (current)\n' "$BOLD" "$MATCHING_OLD_VERSION" "$RESET"
+    else
+        printf '    version: unknown\n'
+    fi
+    printf '\n'
+
+    target_project=$(basename -- "$PROJECT_ROOT")
+    if [[ -n $ARCHIVE_PROJECT && ${target_project,,} != ${ARCHIVE_PROJECT,,} ]]; then
+        printf '%s%sWARNING: PROJECT NAME MISMATCH%s\n' "$BOLD" "$YELLOW" "$RESET" >&2
+        printf '%sTarget directory:   %s%s\n' "$YELLOW" "$target_project" "$RESET" >&2
+        printf '%sIncoming archive:   %s%s\n' "$YELLOW" "$ARCHIVE_PROJECT" "$RESET" >&2
+    fi
+}
+
+print_upgrade_summary
+
+if ((GIT_MODE)); then
+    info "Git finalization will occur only after all hooks pass"
+fi
 if ((RUN_SETUP)); then info 'Will run setup.sh'; fi
-if ((RUN_TEST)); then info "Will run $TEST_HOOK"; fi
+if ((RUN_TEST)); then info "Will run $TEST_HOOK (unless already run by setup.sh)"; fi
 for hook in "${HOOK_PERMISSION_FIXES[@]}"; do info "Will fix executable permission: $hook"; done
 
 if ((DRY_RUN)); then
@@ -473,6 +509,9 @@ if ((GIT_MODE)); then
     GIT_BRANCH="patchzip/$ARCHIVE_STEM"
     git -C "$PROJECT_ROOT" check-ref-format --branch "$GIT_BRANCH" >/dev/null 2>&1 || fatal "invalid Git branch name derived from archive: $GIT_BRANCH"
     git -C "$PROJECT_ROOT" show-ref --verify --quiet "refs/heads/$GIT_BRANCH" && fatal "Git branch already exists: $GIT_BRANCH"
+    if git -C "$PROJECT_ROOT" ls-remote --exit-code --heads origin "$GIT_BRANCH" >/dev/null 2>&1; then
+        fatal "Git remote branch already exists: $GIT_BRANCH"
+    fi
 fi
 
 confirm_apply() {
@@ -511,11 +550,6 @@ confirm_apply() {
 }
 
 confirm_apply || { say 'Cancelled. No changes made.' >&2; exit 0; }
-
-if ((GIT_MODE)); then
-    git -C "$PROJECT_ROOT" switch -c "$GIT_BRANCH" >/dev/null || fatal "could not create Git branch: $GIT_BRANCH"
-    info "Created Git branch: $GIT_BRANCH"
-fi
 
 PATCHDIR_BACKUP=''
 OLD_ARCHIVE_RETIRED=0
@@ -844,13 +878,22 @@ fi
 cleanup_download_archives
 
 if ((GIT_MODE)); then
+    # Hooks are the gate: no branch, staging, commit, or push occurs before they all pass.
+    git -C "$PROJECT_ROOT" switch -c "$GIT_BRANCH" >/dev/null || fatal "could not create Git branch: $GIT_BRANCH"
+    info "Created Git branch: $GIT_BRANCH"
+
     git -C "$PROJECT_ROOT" add -A -- . ':(exclude).patchdir'
     if git -C "$PROJECT_ROOT" diff --cached --quiet; then
         fatal 'nothing to commit after applying archive'
     fi
-    git -C "$PROJECT_ROOT" commit -m "Apply $ARCHIVE_BASE" >/dev/null || fatal 'Git commit failed'
+    git -C "$PROJECT_ROOT" commit -m "Apply $ARCHIVE_BASE" >/dev/null || fatal 'Git commit failed; the local branch was preserved'
     GIT_COMMITTED=1
     info "Committed patch: Apply $ARCHIVE_BASE"
+
+    if ! git -C "$PROJECT_ROOT" push -u origin "$GIT_BRANCH"; then
+        fatal "Git push failed; local branch '$GIT_BRANCH' and commit were preserved"
+    fi
+    info "Pushed branch and established upstream: $GIT_BRANCH"
 fi
 
 report 'success'
