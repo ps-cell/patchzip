@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-VERSION='0.4.27'
+VERSION='0.4.28'
 SCRIPT_NAME='patchzip'
 
 usage() {
@@ -39,8 +39,8 @@ fi
 say() { printf '%s\n' "$*"; }
 fatal() { printf '%s%s%s%s\n' "$RED" 'patchzip: error: ' "$*" "$RESET" >&2; exit 1; }
 info() { printf '→ %s\n' "$*"; }
-success() { printf '%s%s%s\n' "$GREEN" '✓ ' "$*"; }
-warning() { printf '%s%s%s\n' "$YELLOW" '⚠ ' "$*" >&2; }
+success() { printf '%s%s%s%s\n' "$GREEN" '✓ ' "$*" "$RESET"; }
+warning() { printf '%s%s%s%s\n' "$YELLOW" '⚠ ' "$*" "$RESET" >&2; }
 
 DRY_RUN=0
 ASSUME_YES=0
@@ -756,7 +756,7 @@ if ((RUN_TEST && TEST_RAN_BY_SETUP == 0)); then
     else
         status=$?
         TEST_STATUS="failed (exit $status)"
-        printf '%s✗ %s failed (exit %d)%s\n' "$RED" "$TEST_HOOK" "$status" >&2
+        printf '%s✗ %s failed (exit %d)%s\n' "$RED" "$TEST_HOOK" "$status" "$RESET" >&2
         printf '%sArchive was applied successfully, but tests failed.%s\n' "$YELLOW" "$RESET" >&2
         discard_failed_input_archive
         report 'failed'

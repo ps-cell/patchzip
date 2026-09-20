@@ -634,7 +634,7 @@ self_patch_test() {
     mkdir -p "$d" "$dl" "$new" "$bin"
     cp "$BIN" "$d/patchzip"
     cp "$BIN" "$new/patchzip"
-    sed -i "s/VERSION='0.4.27'/VERSION='0.4.1'/" "$new/patchzip"
+    sed -i "s/VERSION='0.4.28'/VERSION='0.4.1'/" "$new/patchzip"
     printf 'old\n' > "$d/payload.txt"
     printf 'new\n' > "$new/payload.txt"
     ln -s "$d/patchzip" "$bin/patchzip"
@@ -1093,6 +1093,9 @@ if b'\x1b[' in run({'NO_COLOR': 'anything'}):
     raise SystemExit('non-empty NO_COLOR did not suppress ANSI color')
 if b'\x1b[' not in run({'NO_COLOR': ''}):
     raise SystemExit('empty NO_COLOR unexpectedly suppressed TTY color')
+out = run({})
+if b'\x1b[32m\xe2\x9c\x93 Done.\x1b[0m' not in out:
+    raise SystemExit('success output was not reset')
 PYTEST
 }
 
@@ -1227,7 +1230,7 @@ install_test() {
     [[ $(readlink -f "$home/.local/bin/patchzip") == "$(readlink -f "$ROOT/patchzip")" ]]
     [[ -L "$home/.local/bin/pzip" ]]
     [[ $(readlink "$home/.local/bin/pzip") == patchzip ]]
-    [[ $(HOME="$home" "$home/.local/bin/patchzip" --version) == 0.4.27 ]]
+    [[ $(HOME="$home" "$home/.local/bin/patchzip" --version) == 0.4.28 ]]
 }
 
 run_test user_local_install install_test
