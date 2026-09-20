@@ -30,7 +30,7 @@ By default, patchzip asks before changing anything. For scripts or automation:
 patchzip --yes path/to/project-v-0.2.zip
 ```
 
-Release archives should use `<project>-v-<version>.zip`, for example `project-v-0.8.13.zip`. The older `<project>-v<version>.zip` form is still accepted.
+Release archives should use `<project>-v-<version>.zip`, for example `project-v-0.8.13.zip`. The older `<project>-v<version>.zip` form is still accepted, as are descriptive suffixes such as `project-v0.8.13-reconstructed.zip`.
 
 If no archive is supplied, patchzip can select an obvious matching archive from `~/Downloads`.
 

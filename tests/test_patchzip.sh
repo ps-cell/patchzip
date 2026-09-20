@@ -434,6 +434,22 @@ namespace_project_selection_test() {
 
 run_test namespace_project_selection namespace_project_selection_test
 
+versioned_archive_suffix_test() {
+    local d="$TMP/suffixed-history" dl="$TMP/suffixed-history-downloads" new="$TMP/new-suffixed-history"
+    mkdir -p "$d" "$dl" "$new"
+    printf old > "$d/a"
+    printf newer > "$new/a"
+    printf historical > "$d/workspace-service-v0.8.13-reconstructed.zip"
+    make_zip "$new" "$dl/workspace-service-v0.8.14.zip"
+    (cd "$d" && "$BIN" "$dl/workspace-service-v0.8.14.zip" --yes --no-setup --no-test >/dev/null)
+    [[ $(cat "$d/a") == newer ]]
+    [[ -f "$d/workspace-service-v0.8.14.zip" ]]
+    [[ ! -f "$d/workspace-service-v0.8.13-reconstructed.zip" ]]
+    [[ $(cat "$d/.patchdir/workspace-service-v0.8.13-reconstructed.zip") == historical ]]
+}
+
+run_test versioned_archive_suffix versioned_archive_suffix_test
+
 case_insensitive_download_selection_test() {
     local d="$TMP/MCP-manager" dl="$TMP/home-case/Downloads" new="$TMP/new-case"
     mkdir -p "$d" "$dl" "$new"
@@ -618,7 +634,7 @@ self_patch_test() {
     mkdir -p "$d" "$dl" "$new" "$bin"
     cp "$BIN" "$d/patchzip"
     cp "$BIN" "$new/patchzip"
-    sed -i "s/VERSION='0.4.26'/VERSION='0.4.1'/" "$new/patchzip"
+    sed -i "s/VERSION='0.4.27'/VERSION='0.4.1'/" "$new/patchzip"
     printf 'old\n' > "$d/payload.txt"
     printf 'new\n' > "$new/payload.txt"
     ln -s "$d/patchzip" "$bin/patchzip"
@@ -1211,7 +1227,7 @@ install_test() {
     [[ $(readlink -f "$home/.local/bin/patchzip") == "$(readlink -f "$ROOT/patchzip")" ]]
     [[ -L "$home/.local/bin/pzip" ]]
     [[ $(readlink "$home/.local/bin/pzip") == patchzip ]]
-    [[ $(HOME="$home" "$home/.local/bin/patchzip" --version) == 0.4.26 ]]
+    [[ $(HOME="$home" "$home/.local/bin/patchzip" --version) == 0.4.27 ]]
 }
 
 run_test user_local_install install_test

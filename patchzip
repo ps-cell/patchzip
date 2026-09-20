@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-VERSION='0.4.26'
+VERSION='0.4.27'
 SCRIPT_NAME='patchzip'
 
 usage() {
@@ -185,7 +185,7 @@ fi
 ARCHIVE_PROJECT=''
 ARCHIVE_VERSION=''
 ARCHIVE_VERSIONED=0
-if [[ $ARCHIVE_ID_STEM =~ ^(.+)-v-?([0-9]+([.][0-9]+)*)$ ]]; then
+if [[ $ARCHIVE_ID_STEM =~ ^(.+)-v-?([0-9]+([.][0-9]+)*)([-_].*)?$ ]]; then
     ARCHIVE_PROJECT=${BASH_REMATCH[1]}
     ARCHIVE_VERSION=${BASH_REMATCH[2]}
     ARCHIVE_VERSIONED=1
@@ -210,7 +210,7 @@ for candidate in "$PROJECT_ROOT"/*.zip "$PROJECT_ROOT"/*.ZIP; do
     if ((ARCHIVE_VERSIONED)); then
         candidate_project=''
         candidate_version=''
-        if [[ $candidate_id_stem =~ ^(.+)-v-?([0-9]+([.][0-9]+)*)$ ]]; then
+        if [[ $candidate_id_stem =~ ^(.+)-v-?([0-9]+([.][0-9]+)*)([-_].*)?$ ]]; then
             candidate_project=${BASH_REMATCH[1]}
             candidate_version=${BASH_REMATCH[2]}
         fi
@@ -790,7 +790,7 @@ cleanup_download_archives() {
         if [[ $identity =~ ^(.+)\([0-9]+\)$ ]]; then
             identity=${BASH_REMATCH[1]}
         fi
-        if [[ $identity =~ ^(.+)-v-?([0-9]+([.][0-9]+)*)$ ]]; then
+        if [[ $identity =~ ^(.+)-v-?([0-9]+([.][0-9]+)*)([-_].*)?$ ]]; then
             candidate_project=${BASH_REMATCH[1]}
             candidate_version=${BASH_REMATCH[2]}
         else
